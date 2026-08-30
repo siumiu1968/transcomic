@@ -3,11 +3,11 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import sharp from 'sharp'
 import { config } from './config.js'
-import type { Store } from './db.js'
+import { hasTranslationOutput, type Store } from './db.js'
 import type { ComixClient } from './comix.js'
 import { parseTranslationOutput, type MangaTranslator, type TranslationContext } from './translator.js'
 import type { JobRow, TranslationMode } from './types.js'
-import { renderTranslation } from './renderer.js'
+import { renderTranslationDetailed } from './renderer.js'
 
 async function atomicWrite(target: string, content: Buffer): Promise<void> {
   await fs.mkdir(path.dirname(target), { recursive: true })
@@ -25,6 +25,12 @@ function translationContext(values: string[], seriesTitle: string, synopsis: str
     }
   })
   return { seriesTitle, synopsis, previousRegions }
+}
+
+export function completionStatus(needsRetranslation: boolean): Pick<JobRow, 'status' | 'error'> {
+  return needsRetranslation
+    ? { status: 'failed', error: '部分頁面未能安全完成嵌字' }
+    : { status: 'completed', error: '' }
 }
 
 export class TranslationQueue {
@@ -98,6 +104,7 @@ export class TranslationQueue {
     const chapter = this.store.getChapter(job.chapter_id)
     if (!chapter) return
     let activePosition = 0
+    let needsRetranslation = false
     this.store.updateJob(job.id, { status: 'running', started_at: new Date().toISOString(), error: '' })
     this.store.setChapterStatus(chapter.id, 'translating')
     try {
@@ -112,10 +119,16 @@ export class TranslationQueue {
       for (const page of pages) {
         activePosition = page.position
         if (this.store.getJob(job.id)?.status === 'cancelled') return
-        if (page.status === 'completed' && page.translated_path) {
-          if (page.translation_json) currentChapterContext.push(page.translation_json)
-          this.store.updateJob(job.id, { current_page: page.position })
-          continue
+        if (hasTranslationOutput(page)) {
+          try {
+            await fs.access(path.join(config.dataDir, page.translated_path))
+            if (this.store.getJob(job.id)?.status === 'cancelled') return
+            currentChapterContext.push(page.translation_json)
+            this.store.updateJob(job.id, { current_page: page.position })
+            continue
+          } catch {
+            this.store.updatePage(chapter.id, page.position, { translated_path: '', status: 'pending', error: '' })
+          }
         }
         this.store.updatePage(chapter.id, page.position, { status: 'translating', error: '' })
         const folder = path.join('media', String(chapter.id))
@@ -156,9 +169,29 @@ export class TranslationQueue {
           series?.synopsis ?? '',
         )
         const translation = await this.translator.translate(original, job.model, job.reasoning_effort, context)
-        const rendered = await renderTranslation(original, translation)
-        await atomicWrite(path.join(config.dataDir, translatedRelative), rendered)
         const translationJson = JSON.stringify(translation)
+        const rendered = await renderTranslationDetailed(original, translation)
+        if (this.store.getJob(job.id)?.status === 'cancelled') {
+          this.store.updatePage(chapter.id, page.position, { status: 'pending', error: '' })
+          return
+        }
+        if (rendered.renderedRegions !== rendered.expectedRegions) {
+          needsRetranslation = true
+          this.store.updatePage(chapter.id, page.position, {
+            translated_path: '',
+            translation_json: translationJson,
+            status: 'needs_retranslation',
+            error: `有 ${rendered.expectedRegions - rendered.renderedRegions} 個對白未能安全嵌字，請重譯`,
+          })
+          currentChapterContext.push(translationJson)
+          this.store.updateJob(job.id, { current_page: page.position })
+          continue
+        }
+        await atomicWrite(path.join(config.dataDir, translatedRelative), rendered.image)
+        if (this.store.getJob(job.id)?.status === 'cancelled') {
+          this.store.updatePage(chapter.id, page.position, { status: 'pending', error: '' })
+          return
+        }
         this.store.updatePage(chapter.id, page.position, {
           translated_path: translatedRelative,
           translation_json: translationJson,
@@ -168,8 +201,13 @@ export class TranslationQueue {
         currentChapterContext.push(translationJson)
         this.store.updateJob(job.id, { current_page: page.position })
       }
-      this.store.updateJob(job.id, { status: 'completed', current_page: sourcePages.length, finished_at: new Date().toISOString() })
-      this.store.setChapterStatus(chapter.id, 'completed')
+      if (this.store.getJob(job.id)?.status === 'cancelled') return
+      this.store.updateJob(job.id, {
+        ...completionStatus(needsRetranslation),
+        current_page: sourcePages.length,
+        finished_at: new Date().toISOString(),
+      })
+      this.store.setChapterStatus(chapter.id, needsRetranslation ? 'needs_retranslation' : 'completed')
     } catch (error) {
       const message = error instanceof Error ? error.message : '翻譯工作失敗'
       if (this.store.getJob(job.id)?.status !== 'cancelled') {

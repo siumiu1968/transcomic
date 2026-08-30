@@ -1,10 +1,11 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { assertTranslationModel } from './config.js'
 import type { ChapterRow, JobRow, PageRow, SeriesRow, SourceChapter, SourcePage, SourceSeries } from './types.js'
 
-export function hasTranslationOutput(page: Pick<PageRow, 'translated_path' | 'translation_json'>): boolean {
-  return Boolean(page.translated_path && page.translation_json.trim())
+export function hasTranslationOutput(page: Pick<PageRow, 'translated_path' | 'translation_json' | 'status'>): boolean {
+  return page.status === 'completed' && Boolean(page.translated_path && page.translation_json.trim())
 }
 
 export class Store {
@@ -85,7 +86,15 @@ export class Store {
     }
     this.db.prepare("UPDATE jobs SET status='queued', started_at='' WHERE status='running'").run()
     this.db.prepare("UPDATE chapters SET status='queued' WHERE status='translating'").run()
-    this.db.prepare("UPDATE jobs SET model='gpt-5.6-luna', reasoning_effort='max' WHERE status='queued' AND model='gpt-5.6-sol'").run()
+    this.db.prepare("UPDATE jobs SET model='gpt-5.6-luna', reasoning_effort='max' WHERE status='queued' AND model!='gpt-5.6-luna'").run()
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS jobs_luna_only_insert
+      BEFORE INSERT ON jobs WHEN NEW.model!='gpt-5.6-luna'
+      BEGIN SELECT RAISE(ABORT, '翻譯工作只允許使用 gpt-5.6-luna'); END;
+      CREATE TRIGGER IF NOT EXISTS jobs_luna_only_model_update
+      BEFORE UPDATE OF model ON jobs WHEN NEW.model!='gpt-5.6-luna'
+      BEGIN SELECT RAISE(ABORT, '翻譯工作只允許使用 gpt-5.6-luna'); END;
+    `)
     // A pre-region renderer could write a translated image without recording any
     // translation output. Keep the file intact, but prevent it being presented as
     // a real translation or silently skipped by a later manual retry.
@@ -235,7 +244,7 @@ export class Store {
   }
 
   createJob(job: Pick<JobRow, 'id' | 'chapter_id' | 'model' | 'reasoning_effort'>): void {
-    this.db.prepare('INSERT INTO jobs (id, chapter_id, model, reasoning_effort) VALUES (?, ?, ?, ?)').run(job.id, job.chapter_id, job.model, job.reasoning_effort)
+    this.db.prepare('INSERT INTO jobs (id, chapter_id, model, reasoning_effort) VALUES (?, ?, ?, ?)').run(job.id, job.chapter_id, assertTranslationModel(job.model), job.reasoning_effort)
     this.setChapterStatus(job.chapter_id, 'queued')
   }
 

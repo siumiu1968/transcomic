@@ -20,6 +20,15 @@ function reasoningEffort(name: string, fallback: ReasoningEffort): ReasoningEffo
   return reasoningEfforts.includes(value as ReasoningEffort) ? value as ReasoningEffort : fallback
 }
 
+export function assertTranslationModel(value: string, name = '翻譯模型'): 'gpt-5.6-luna' {
+  if (value !== 'gpt-5.6-luna') throw new Error(`${name} 只允許使用 gpt-5.6-luna`)
+  return value
+}
+
+function translationModel(name: string): 'gpt-5.6-luna' {
+  return assertTranslationModel(process.env[name]?.trim() || 'gpt-5.6-luna', name)
+}
+
 export const config = {
   host: process.env.HOST ?? '127.0.0.1',
   port: integer('PORT', 4178),
@@ -31,12 +40,13 @@ export const config = {
   comixBootstrapUrl: process.env.COMIX_BOOTSTRAP_URL ?? 'https://comix.to/title/n9vgy',
   browserExecutablePath: process.env.PATCHRIGHT_EXECUTABLE_PATH,
   browserHeadless: process.env.BROWSER_HEADLESS !== '0',
-  modelFast: process.env.TRANSLATION_MODEL_FAST ?? 'gpt-5.6-luna',
-  modelBalanced: process.env.TRANSLATION_MODEL_BALANCED ?? 'gpt-5.6-luna',
-  modelQuality: process.env.TRANSLATION_MODEL_QUALITY ?? 'gpt-5.6-luna',
+  modelFast: translationModel('TRANSLATION_MODEL_FAST'),
+  modelBalanced: translationModel('TRANSLATION_MODEL_BALANCED'),
+  modelQuality: translationModel('TRANSLATION_MODEL_QUALITY'),
   effortFast: reasoningEffort('TRANSLATION_EFFORT_FAST', 'low'),
   effortBalanced: reasoningEffort('TRANSLATION_EFFORT_BALANCED', 'high'),
   effortQuality: reasoningEffort('TRANSLATION_EFFORT_QUALITY', 'max'),
+  effortAudit: reasoningEffort('TRANSLATION_EFFORT_AUDIT', 'low'),
   maxImageEdge: integer('MAX_IMAGE_EDGE', 2048),
   translationBackend: process.env.TRANSLATION_BACKEND ?? 'openai',
   codexCliPath: process.env.CODEX_CLI_PATH ?? 'codex',

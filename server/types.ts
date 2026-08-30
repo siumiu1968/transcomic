@@ -37,6 +37,7 @@ export interface TranslationRegion {
   id: number
   bubble: TranslationBox
   safe: TranslationBox
+  lines?: TranslationBox[]
   source: string
   translation: string
   kind: 'speech' | 'narration' | 'sfx'

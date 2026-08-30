@@ -147,7 +147,9 @@ app.get('/transcomic/api/media/:kind/:chapterId/:position', (request, response) 
   const chapterId = parseId(request.params.chapterId)
   const position = parseId(request.params.position)
   const page = store.listPages(chapterId).find((item) => item.position === position)
-  const stored = request.params.kind === 'translated' ? page?.translated_path : request.params.kind === 'original' ? page?.original_path : ''
+  const stored = request.params.kind === 'translated'
+    ? page && hasTranslationOutput(page) ? page.translated_path : ''
+    : request.params.kind === 'original' ? page?.original_path : ''
   if (!stored) {
     response.status(404).end()
     return
