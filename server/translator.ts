@@ -395,7 +395,7 @@ function buildCompletenessPrompt(current: TranslationResult, candidates: OcrHint
   return [
     '只分析附加嘅同一張漫畫頁面，不得使用任何工具或讀取其他檔案。',
     '呢次係 OCR 完整度閘門觸發嘅定點查漏。第一張係乾淨原圖；第二張校對圖入面，藍框／紅框係已翻譯區域，黃色 OCR 框係仍未被任何已翻譯 safe 範圍覆蓋嘅英文。逐個黃色框查看原圖上下文；多個相鄰黃色框可能屬於同一個對話泡。',
-    '只回傳黃色框所屬、而且確實係角色對白或推進故事旁白嘅完整 bubble。頁頂／頁底被裁切、承接上一頁或下一頁嘅泡，只要畫面內文字清楚可讀亦必須回傳。',
+    '逐個黃色框作決定；只要確實係角色對白或推進故事旁白，就必須回傳佢所屬嘅完整 bubble。頁頂／頁底被裁切、承接上一頁或下一頁、甚至畫面只見半句，都要翻譯當頁清楚可讀嘅部分，唔可以等下一頁或因句子不完整而略過。相鄰黃色框屬同一個泡時要合併成一個 region，source 必須包含畫面可見候選文字。',
     '嚴禁回傳擬聲詞、動作音效、招式裝飾字、章節／作品標題、頁碼、網站／掃圖組字樣、水印、署名或來源資訊；黃色框只係可能有漏項嘅 OCR 提示，唔代表一定要翻譯。已存在嘅藍／紅框內容亦唔好重複。',
     `新 region id 由 ${nextId} 開始連續遞增。按日漫閱讀次序由右至左、由上至下。翻譯成自然繁體中文（香港用語）。每個 region 提供精準 bubble、safe、lines（0 至 1000 座標）；lines 緊貼每行原文字，safe 係 lines 緊密聯集並完全位於 bubble。只輸出符合 schema 嘅 JSON。`,
     `UNCOVERED OCR CANDIDATES:\n${JSON.stringify(candidates)}`,
@@ -495,7 +495,7 @@ export class MangaTranslator {
       return this.translatePrepared(
         [prepared, completenessGuide],
         model,
-        config.effortAudit,
+        config.effortBalanced,
         buildCompletenessPrompt(audited, candidates, context),
       )
     })
