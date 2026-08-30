@@ -7,7 +7,7 @@ import sharp from 'sharp'
 import { isAllowedSourceUrl } from './comix.js'
 import { Store } from './db.js'
 import { balanceTranslationLines, normalizeDisplayText, renderTranslation } from './renderer.js'
-import { parseTranslationOutput } from './translator.js'
+import { codexTimeoutForEffort, parseTranslationOutput } from './translator.js'
 
 test('source image allowlist blocks SSRF targets', () => {
   assert.equal(isAllowedSourceUrl('https://static.comix.to/poster.webp'), true)
@@ -55,6 +55,11 @@ test('translation output parser accepts strict and fenced JSON', () => {
   assert.deepEqual(parseTranslationOutput(JSON.stringify(expected)), expected)
   assert.deepEqual(parseTranslationOutput(`\`\`\`json\n${JSON.stringify(expected)}\n\`\`\``), expected)
   assert.deepEqual(parseTranslationOutput(JSON.stringify({ regions: [{ bubble: {}, safe: {}, translation: '錯誤框', kind: 'speech' }] })), { regions: [] })
+})
+
+test('Max reasoning has enough time for dense manga pages', () => {
+  assert.ok(codexTimeoutForEffort('max') >= 15 * 60_000)
+  assert.ok(codexTimeoutForEffort('xhigh') >= 10 * 60_000)
 })
 
 test('store imports a series and chapters without duplicating them', () => {

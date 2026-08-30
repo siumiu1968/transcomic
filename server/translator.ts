@@ -18,6 +18,12 @@ interface TranslationProfile {
   effort: ReasoningEffort
 }
 
+export function codexTimeoutForEffort(effort: ReasoningEffort): number {
+  if (effort === 'max') return Math.max(config.codexTimeoutMs, 15 * 60_000)
+  if (effort === 'xhigh') return Math.max(config.codexTimeoutMs, 10 * 60_000)
+  return config.codexTimeoutMs
+}
+
 const boxSchema = {
   type: 'object',
   additionalProperties: false,
@@ -230,7 +236,7 @@ export class MangaTranslator {
         const timeout = setTimeout(() => {
           timedOut = true
           child.kill('SIGTERM')
-        }, config.codexTimeoutMs)
+        }, codexTimeoutForEffort(effort))
         child.stderr.on('data', (chunk: Buffer) => {
           if (stderr.length < 64_000) stderr += chunk.toString('utf8')
         })
