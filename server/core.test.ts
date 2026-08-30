@@ -7,6 +7,7 @@ import sharp from 'sharp'
 import { isAllowedSourceUrl } from './comix.js'
 import { Store } from './db.js'
 import { renderTranslation } from './renderer.js'
+import { parseTranslationOutput } from './translator.js'
 
 test('source image allowlist blocks SSRF targets', () => {
   assert.equal(isAllowedSourceUrl('https://static.comix.to/poster.webp'), true)
@@ -25,6 +26,12 @@ test('renderer preserves page dimensions and emits webp', async () => {
   assert.equal(metadata.width, 600)
   assert.equal(metadata.height, 900)
   assert.equal(metadata.format, 'webp')
+})
+
+test('translation output parser accepts strict and fenced JSON', () => {
+  const expected = { regions: [{ x: 10, y: 20, width: 30, height: 40, translation: '你好', kind: 'speech' as const }] }
+  assert.deepEqual(parseTranslationOutput(JSON.stringify(expected)), expected)
+  assert.deepEqual(parseTranslationOutput(`\`\`\`json\n${JSON.stringify(expected)}\n\`\`\``), expected)
 })
 
 test('store imports a series and chapters without duplicating them', () => {

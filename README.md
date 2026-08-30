@@ -18,12 +18,12 @@ TransComic 係一個網頁漫畫翻譯工作台：由獲授權嘅 Comix 來源�
 - React 19 + Vite
 - Express 5 + Node.js SQLite
 - Patchright（已授權網頁連接）
-- OpenAI Responses API（圖像輸入 + 結構化輸出）
+- Codex CLI 或 OpenAI Responses API（圖像輸入 + 結構化輸出）
 - Sharp（頁面正規化與譯文合成）
 
 ## 本機啟動
 
-需要 Node.js 22 或以上、Chromium，以及有效嘅 OpenAI API key。
+需要 Node.js 22 或以上、Chromium，以及已登入嘅 Codex CLI；亦可改用有效嘅 OpenAI API key。
 
 ```bash
 cp .env.example .env

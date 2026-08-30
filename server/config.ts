@@ -1,4 +1,11 @@
 import path from 'node:path'
+import { loadEnvFile } from 'node:process'
+
+try {
+  loadEnvFile()
+} catch (error) {
+  if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+}
 
 function integer(name: string, fallback: number): number {
   const value = Number.parseInt(process.env[name] ?? '', 10)
@@ -20,4 +27,7 @@ export const config = {
   modelBalanced: process.env.TRANSLATION_MODEL_BALANCED ?? 'gpt-5.6-terra',
   modelQuality: process.env.TRANSLATION_MODEL_QUALITY ?? 'gpt-5.6-sol',
   maxImageEdge: integer('MAX_IMAGE_EDGE', 2048),
+  translationBackend: process.env.TRANSLATION_BACKEND ?? 'openai',
+  codexCliPath: process.env.CODEX_CLI_PATH ?? 'codex',
+  codexTimeoutMs: integer('CODEX_TIMEOUT_SECONDS', 300) * 1000,
 }
