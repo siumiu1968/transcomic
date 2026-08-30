@@ -20,6 +20,14 @@ function chapterNumber(value: number): string {
   return Number.isInteger(value) ? String(value) : value.toFixed(1)
 }
 
+function synopsisText(value: string): string {
+  return value
+    .replace(/\[([^\]]+)\]\(https?:\/\/[^)]+\)/gu, '$1')
+    .replace(/[*_~`#>]+/gu, '')
+    .replace(/\s+/gu, ' ')
+    .trim()
+}
+
 function statusLabel(status: Chapter['status'] | Job['status']): string {
   return ({
     ready: '未翻譯', queued: '等候中', translating: '翻譯中', running: '翻譯中',
@@ -295,7 +303,7 @@ function App() {
                 <div className="series-copy">
                   <span className="eyebrow">{selectedSeries.source_language?.toUpperCase()} · {selectedSeries.status}</span>
                   <h1>{selectedSeries.title}</h1>
-                  <p>{selectedSeries.synopsis || '未有作品簡介。'}</p>
+                  <p>{synopsisText(selectedSeries.synopsis) || '未有作品簡介。'}</p>
                   <div className="series-stats"><span><strong>{selectedSeries.chapter_count}</strong>章節</span><span><strong>{selectedSeries.translated_count}</strong>已完成</span><span><strong>{activeJobs.filter((job) => job.series_hid === selectedSeries.hid).length}</strong>處理中</span></div>
                 </div>
               </div>

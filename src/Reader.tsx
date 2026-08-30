@@ -114,6 +114,7 @@ export function Reader({ chapterId, onClose }: ReaderProps) {
   const jump = (position: number) => {
     setCurrent(position - 1)
     if (layout === 'long') document.getElementById(`reader-page-${position}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    if (window.matchMedia('(max-width: 680px)').matches) setSidebar(false)
   }
 
   const displayUrl = (page: ReaderPage) => translated && page.translatedUrl ? page.translatedUrl : page.originalUrl
