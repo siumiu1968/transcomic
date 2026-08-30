@@ -96,7 +96,11 @@ function normalize(value: unknown): TranslationResult {
     if (!bubble || !safe) return []
     if (safe.x < bubble.x || safe.y < bubble.y || safe.x + safe.width > bubble.x + bubble.width || safe.y + safe.height > bubble.y + bubble.height) return []
     const safeMargin = Math.max(2, Math.min(bubble.width, bubble.height) * 0.015)
-    if (safe.x < bubble.x + safeMargin || safe.y < bubble.y + safeMargin || safe.x + safe.width > bubble.x + bubble.width - safeMargin || safe.y + safe.height > bubble.y + bubble.height - safeMargin) return []
+    const leftMargin = bubble.x <= 2 ? 0 : safeMargin
+    const topMargin = bubble.y <= 2 ? 0 : safeMargin
+    const rightMargin = bubble.x + bubble.width >= 998 ? 0 : safeMargin
+    const bottomMargin = bubble.y + bubble.height >= 998 ? 0 : safeMargin
+    if (safe.x < bubble.x + leftMargin || safe.y < bubble.y + topMargin || safe.x + safe.width > bubble.x + bubble.width - rightMargin || safe.y + safe.height > bubble.y + bubble.height - bottomMargin) return []
     const lines = Array.isArray(region.lines) ? region.lines.flatMap((value) => {
       const line = normalizeBox(value)
       if (!line) return []

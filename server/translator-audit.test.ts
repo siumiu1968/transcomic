@@ -89,6 +89,21 @@ test('audit keeps heavily overlapping bubbles with different dialogue distinct',
   assert.equal(mergeTranslationResults(primary, audit).regions.length, 2)
 })
 
+test('parser accepts safe text geometry touching a genuinely clipped page edge', () => {
+  const parsed = parseTranslationOutput(JSON.stringify({ regions: [{
+    id: 1,
+    bubble: { x: 30, y: 0, width: 430, height: 170 },
+    safe: { x: 70, y: 0, width: 350, height: 82 },
+    lines: [{ x: 90, y: 1, width: 310, height: 20 }],
+    source: 'YET THE MOMENT I HEARD THE OTHERS CRYING...',
+    translation: '但當我聽到其他人喊嗰一刻……',
+    kind: 'speech',
+  }] }))
+
+  assert.equal(parsed.regions.length, 1)
+  assert.equal(parsed.regions[0]?.safe.y, 0)
+})
+
 test('OCR completeness gate catches obvious clipped dialogue outside translated safe boxes', () => {
   const translated = parseTranslationOutput(JSON.stringify({ regions: [{
     id: 1,
