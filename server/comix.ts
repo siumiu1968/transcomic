@@ -175,9 +175,13 @@ export class ComixClient {
       if (new URL(page.url()).pathname !== chapterHref.pathname) await this.navigate(page, chapterHref.toString())
       const pageSelector = `.rpage-page[data-page="${pagePosition}"] canvas`
       await page.waitForSelector(`[aria-label="Go to page ${pagePosition}"]`, { timeout: 90_000 })
-      // Reader ads can sit above the progress rail; the button's own handler is still valid.
-      await page.locator(`[aria-label="Go to page ${pagePosition}"]`).click({ force: true })
-      await page.waitForSelector(pageSelector, { timeout: 90_000 })
+      // Reader ads can sit above the progress rail, so invoke the button handler directly.
+      await page.evaluate((position) => {
+        const button = document.querySelector<HTMLButtonElement>(`[aria-label="Go to page ${position}"]`)
+        if (!button) throw new Error('原站未有指定頁碼')
+        button.click()
+      }, pagePosition)
+      await page.waitForSelector(pageSelector, { state: 'attached', timeout: 90_000 })
       await page.waitForTimeout(250)
       const dataUrl = await page.evaluate((selector) => {
         const canvas = document.querySelector<HTMLCanvasElement>(selector)

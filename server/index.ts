@@ -11,6 +11,7 @@ import type { TranslationMode } from './types.js'
 const app = express()
 const store = new Store(config.dataDir)
 const comix = new ComixClient()
+const mediaComix = new ComixClient()
 const translator = new MangaTranslator()
 const queue = new TranslationQueue(store, comix, translator)
 
@@ -121,7 +122,7 @@ app.get('/transcomic/api/source-image', asyncRoute(async (request, response) => 
       response.status(404).json({ error: '找不到來源頁面' })
       return
     }
-    const image = await comix.downloadSource(sourceUrl)
+    const image = await mediaComix.downloadSource(sourceUrl)
     response.setHeader('Content-Type', image.contentType)
     response.setHeader('Cache-Control', 'private, max-age=3600')
     response.send(image.body)
@@ -131,7 +132,7 @@ app.get('/transcomic/api/source-image', asyncRoute(async (request, response) => 
     response.status(404).json({ error: '找不到來源頁面' })
     return
   }
-  const image = await comix.downloadSource(page.source_url, {
+  const image = await mediaComix.downloadSource(page.source_url, {
     chapterUrl: chapter.source_url,
     pagePosition: page.position,
     scramble: page.scramble === 1,
@@ -208,7 +209,7 @@ const server = app.listen(config.port, config.host, () => {
 
 async function shutdown(): Promise<void> {
   server.close()
-  await comix.close()
+  await Promise.all([comix.close(), mediaComix.close()])
   store.db.close()
 }
 
