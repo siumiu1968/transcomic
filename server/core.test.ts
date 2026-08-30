@@ -8,7 +8,7 @@ import { isAllowedSourceUrl } from './comix.js'
 import { config } from './config.js'
 import { hasTranslationOutput, Store } from './db.js'
 import { completionStatus, TranslationQueue } from './queue.js'
-import { balanceTranslationLines, matchEdgeClippedOcrLines, matchOcrLines, normalizeDisplayText, renderTranslation, renderTranslationDetailed } from './renderer.js'
+import { balanceTranslationLines, matchEdgeClippedOcrLines, matchOcrLines, normalizeDisplayText, planNarrationCaption, renderTranslation, renderTranslationDetailed } from './renderer.js'
 import { codexTimeoutForEffort, mergeTranslationResults, parseTranslationOutput, withAuditFallback } from './translator.js'
 
 test('source image allowlist blocks SSRF targets', () => {
@@ -110,6 +110,155 @@ test('OCR line matching joins split words and ignores duplicate noise', () => {
     source: 'PREPARED',
   })
   assert.deepEqual(lines, [{ x: 120, y: 140, width: 106, height: 20 }])
+})
+
+test('OCR line matching keeps a high-confidence stutter initial beside matched dialogue', () => {
+  const lines = matchOcrLines([
+    { x: 100, y: 140, width: 18, height: 20, confidence: 94, line: '1:1:1:1', text: 'B,' },
+    { x: 126, y: 140, width: 40, height: 20, confidence: 96, line: '1:1:1:1', text: 'BUT' },
+    { x: 174, y: 140, width: 30, height: 20, confidence: 95, line: '1:1:1:1', text: 'HE' },
+  ], {
+    x: 80,
+    y: 100,
+    width: 180,
+    height: 100,
+    source: 'B, BUT HE',
+  })
+  assert.deepEqual(lines, [{ x: 100, y: 140, width: 104, height: 20 }])
+})
+
+test('narration caption fallback requires complete OCR aligned to every model row', () => {
+  const narration = {
+    x: 80,
+    y: 100,
+    width: 300,
+    height: 200,
+    safe: { x: 100, y: 120, width: 260, height: 120 },
+    lines: [
+      { x: 116, y: 136, width: 136, height: 28 },
+      { x: 140, y: 172, width: 140, height: 28 },
+    ],
+    source: 'THE NIGHT REMEMBERS',
+    text: '黑夜仍然記得。',
+    kind: 'narration' as const,
+  }
+  const ocr = [
+    { x: 120, y: 140, width: 42, height: 20, confidence: 96, line: '1:1:1:1', text: 'THE' },
+    { x: 170, y: 140, width: 78, height: 20, confidence: 94, line: '1:1:1:1', text: 'NIGHT' },
+    { x: 145, y: 176, width: 130, height: 20, confidence: 92, line: '1:1:1:2', text: 'REMEMBERS' },
+  ]
+
+  assert.deepEqual(planNarrationCaption(ocr, narration, 600, 900), {
+    bounds: { x: 113, y: 135, width: 169, height: 66 },
+    lines: [
+      { x: 120, y: 140, width: 128, height: 20 },
+      { x: 145, y: 176, width: 130, height: 20 },
+    ],
+  })
+  assert.equal(planNarrationCaption(ocr, { ...narration, kind: 'speech' }, 600, 900), null)
+  assert.equal(planNarrationCaption(ocr, {
+    ...narration,
+    lines: narration.lines.map((line) => ({ ...line, y: line.y + 90 })),
+  }, 600, 900), null)
+  assert.equal(planNarrationCaption(ocr.map((word) => ({ ...word, text: 'WRONG' })), narration, 600, 900), null)
+})
+
+test('narration caption uses complete contiguous OCR geometry for tight regions', () => {
+  const narration = {
+    x: 100,
+    y: 120,
+    width: 180,
+    height: 110,
+    safe: { x: 105, y: 125, width: 170, height: 100 },
+    lines: [
+      { x: 108, y: 128, width: 128, height: 28 },
+      { x: 106, y: 161, width: 158, height: 28 },
+    ],
+    source: 'THE NIGHT STILL REMEMBERS EVERYTHING',
+    text: '黑夜仍然記得一切。',
+    kind: 'narration' as const,
+  }
+  const ocr = [
+    { x: 112, y: 132, width: 35, height: 20, confidence: 96, line: '1:1:1:1', text: 'THE' },
+    { x: 154, y: 132, width: 76, height: 20, confidence: 94, line: '1:1:1:1', text: 'NIGHT' },
+    { x: 110, y: 165, width: 42, height: 20, confidence: 93, line: '1:1:1:2', text: 'STILL' },
+    { x: 159, y: 165, width: 101, height: 20, confidence: 91, line: '1:1:1:2', text: 'REMEMBERS' },
+    { x: 120, y: 198, width: 130, height: 20, confidence: 95, line: '1:1:1:3', text: 'EVERYTHING' },
+  ]
+  const plan = planNarrationCaption(ocr, narration, 600, 900)
+  assert.deepEqual(plan, {
+    bounds: { x: 103, y: 127, width: 164, height: 96 },
+    lines: [
+      { x: 112, y: 132, width: 118, height: 20 },
+      { x: 110, y: 165, width: 150, height: 20 },
+      { x: 120, y: 198, width: 130, height: 20 },
+    ],
+  })
+  assert.ok((plan?.bounds.width ?? 0) * (plan?.bounds.height ?? 0) > narration.width * narration.height * 0.7)
+
+  const disjoint = ocr.map((word) => word.line === '1:1:1:3' ? { ...word, y: word.y + 55 } : word)
+  assert.equal(planNarrationCaption(disjoint, narration, 600, 900), null)
+  assert.equal(planNarrationCaption([
+    ...ocr,
+    { x: 125, y: 220, width: 65, height: 20, confidence: 93, line: '1:1:1:4', text: 'AGAIN' },
+    { x: 120, y: 242, width: 90, height: 20, confidence: 92, line: '1:1:1:5', text: 'FOREVER' },
+  ], {
+    ...narration,
+    height: 140,
+    safe: { ...narration.safe, height: 130 },
+    source: `${narration.source} AGAIN FOREVER`,
+  }, 600, 900), null)
+})
+
+test('narration caption without model rows requires at least two strict-safe OCR rows', () => {
+  const narration = {
+    x: 90,
+    y: 90,
+    width: 220,
+    height: 100,
+    safe: { x: 100, y: 100, width: 200, height: 80 },
+    lines: [],
+    source: 'ONLY THE TRUTH',
+    text: '只有真相。',
+    kind: 'narration' as const,
+  }
+  const ocr = [
+    { x: 115, y: 112, width: 50, height: 18, confidence: 96, line: '1:1:1:1', text: 'ONLY' },
+    { x: 172, y: 112, width: 38, height: 18, confidence: 95, line: '1:1:1:1', text: 'THE' },
+    { x: 125, y: 145, width: 90, height: 18, confidence: 94, line: '1:1:1:2', text: 'TRUTH' },
+  ]
+  assert.ok(planNarrationCaption(ocr, narration, 600, 900))
+  assert.equal(planNarrationCaption(ocr.filter((word) => word.line === '1:1:1:1'), { ...narration, source: 'ONLY THE' }, 600, 900), null)
+  assert.equal(planNarrationCaption(ocr.map((word) => word.line === '1:1:1:2' ? { ...word, y: 192 } : word), narration, 600, 900), null)
+})
+
+test('model-backed narration tolerates one cropped single-letter source word', () => {
+  const narration = {
+    x: 80,
+    y: 100,
+    width: 360,
+    height: 130,
+    safe: { x: 90, y: 105, width: 340, height: 115 },
+    lines: [
+      { x: 100, y: 112, width: 300, height: 24 },
+      { x: 110, y: 150, width: 280, height: 24 },
+    ],
+    source: 'I WANTED TO RUN TO THAT PERSON RIGHT AWAY',
+    text: '我想即刻跑到嗰個人身邊。',
+    kind: 'narration' as const,
+  }
+  const ocr = [
+    { x: 105, y: 114, width: 105, height: 20, confidence: 96, line: '1:1:1:1', text: 'WANTED' },
+    { x: 218, y: 114, width: 35, height: 20, confidence: 95, line: '1:1:1:1', text: 'TO' },
+    { x: 112, y: 153, width: 48, height: 20, confidence: 96, line: '1:1:1:2', text: 'RUN' },
+    { x: 168, y: 153, width: 35, height: 20, confidence: 95, line: '1:1:1:2', text: 'TO' },
+    { x: 211, y: 153, width: 58, height: 20, confidence: 95, line: '1:1:1:2', text: 'THAT' },
+    { x: 277, y: 153, width: 82, height: 20, confidence: 95, line: '1:1:1:2', text: 'PERSON' },
+    { x: 120, y: 188, width: 68, height: 20, confidence: 96, line: '1:1:1:3', text: 'RIGHT' },
+    { x: 196, y: 188, width: 58, height: 20, confidence: 96, line: '1:1:1:3', text: 'AWAY' },
+  ]
+  assert.ok(planNarrationCaption(ocr, narration, 600, 900))
+  assert.equal(planNarrationCaption(ocr, { ...narration, lines: [], safe: { ...narration.safe, height: 120 } }, 600, 900), null)
 })
 
 test('renderer accepts one clipped top row only when three clear OCR rows align', () => {
