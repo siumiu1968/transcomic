@@ -17,7 +17,13 @@ interface PixelRegion extends PixelBox {
   safe: PixelBox
   text: string
   kind: 'speech' | 'narration'
-  edgeFallback: boolean
+}
+
+interface BoundaryAllowance {
+  left: boolean
+  top: boolean
+  right: boolean
+  bottom: boolean
 }
 
 function escapeMarkup(value: string): string {
@@ -106,12 +112,10 @@ function toPixelRegion(region: TranslationRegion, imageWidth: number, imageHeigh
   const safe = convert(region.safe)
   const { x, y, width, height } = bubble
   if (width < 28 || height < 24) return null
-  const edgeMargin = Math.max(4, Math.round(Math.min(imageWidth, imageHeight) * 0.006))
   if (safe.width < 18 || safe.height < 14) return null
   if (safe.x < x || safe.y < y || safe.x + safe.width > x + width || safe.y + safe.height > y + height) return null
   if (width > imageWidth * 0.65 && height < imageHeight * 0.08) return null
-  const edgeFallback = x < edgeMargin || y < edgeMargin || x + width > imageWidth * 0.97 || y + height > imageHeight * 0.97
-  return { ...bubble, safe, text, kind: region.kind === 'narration' ? 'narration' : 'speech', edgeFallback }
+  return { ...bubble, safe, text, kind: region.kind === 'narration' ? 'narration' : 'speech' }
 }
 
 async function createTextLayer(region: PixelRegion, imageWidth: number): Promise<{ input: Buffer; top: number; left: number }> {
@@ -174,7 +178,7 @@ async function createTextLayer(region: PixelRegion, imageWidth: number): Promise
   }
 }
 
-function connectedBubbleInterior(gray: Uint8Array, width: number, height: number, safe: PixelBox): { mask: Buffer; bounds: PixelBox } | null {
+function connectedBubbleInterior(gray: Uint8Array, width: number, height: number, safe: PixelBox, allowedBoundary: BoundaryAllowance): { mask: Buffer; bounds: PixelBox } | null {
   const visited = new Uint8Array(width * height)
   let best: number[] = []
   let bestOverlap = -1
@@ -195,7 +199,10 @@ function connectedBubbleInterior(gray: Uint8Array, width: number, height: number
     let minimumY = height
     let maximumX = 0
     let maximumY = 0
-    let touchesBoundary = false
+    let touchesLeft = false
+    let touchesTop = false
+    let touchesRight = false
+    let touchesBottom = false
     queue[tail++] = origin
     visited[origin] = 1
     while (head < tail) {
@@ -207,7 +214,10 @@ function connectedBubbleInterior(gray: Uint8Array, width: number, height: number
       minimumY = Math.min(minimumY, y)
       maximumX = Math.max(maximumX, x)
       maximumY = Math.max(maximumY, y)
-      if (x === 0 || y === 0 || x === width - 1 || y === height - 1) touchesBoundary = true
+      if (x === 0) touchesLeft = true
+      if (y === 0) touchesTop = true
+      if (x === width - 1) touchesRight = true
+      if (y === height - 1) touchesBottom = true
       if (x >= safeLeft && x < safeRight && y >= safeTop && y < safeBottom) overlap += 1
       const neighbours = [index - 1, index + 1, index - width, index + width]
       for (const neighbour of neighbours) {
@@ -218,7 +228,11 @@ function connectedBubbleInterior(gray: Uint8Array, width: number, height: number
         queue[tail++] = neighbour
       }
     }
-    if (!touchesBoundary && (overlap > bestOverlap || (overlap === bestOverlap && component.length > best.length))) {
+    const touchesDisallowedBoundary = (touchesLeft && !allowedBoundary.left)
+      || (touchesTop && !allowedBoundary.top)
+      || (touchesRight && !allowedBoundary.right)
+      || (touchesBottom && !allowedBoundary.bottom)
+    if (!touchesDisallowedBoundary && (overlap > bestOverlap || (overlap === bestOverlap && component.length > best.length))) {
       best = component
       bestOverlap = overlap
       bestBounds = { x: minimumX, y: minimumY, width: maximumX - minimumX + 1, height: maximumY - minimumY + 1 }
@@ -291,9 +305,15 @@ async function createCleanupLayer(image: Buffer, region: PixelRegion, imageWidth
     width: region.safe.width,
     height: region.safe.height,
   }
-  const interior = connectedBubbleInterior(gray, width, height, relativeSafe)
+  const edgeTolerance = Math.max(4, Math.round(Math.min(imageWidth, imageHeight) * 0.012))
+  const allowedBoundary = {
+    left: region.x <= edgeTolerance,
+    top: region.y <= edgeTolerance,
+    right: region.x + region.width >= imageWidth - edgeTolerance,
+    bottom: region.y + region.height >= imageHeight - edgeTolerance,
+  }
+  const interior = connectedBubbleInterior(gray, width, height, relativeSafe, allowedBoundary)
   if (!interior) return null
-  if (interior.bounds.x + interior.bounds.width >= width - 2 && left + width > imageWidth * 0.94) return null
   const filledInterior = fillEnclosedHoles(interior.mask, width, height)
   const darkText = Buffer.alloc(width * height)
   const guard = Math.max(2, Math.round(imageWidth / 520))
@@ -367,7 +387,7 @@ async function createSafeCleanupLayer(image: Buffer, region: PixelRegion): Promi
     .toBuffer()
   return {
     overlay: { input, top, left },
-    layout: { ...region, x: left, y: top, width, height },
+    layout: { ...region, ...region.safe },
   }
 }
 
@@ -382,10 +402,8 @@ export async function renderTranslation(image: Buffer, result: TranslationResult
   })
   if (regions.length === 0) return base.webp({ quality: 92 }).toBuffer()
   const renderedRegions = await Promise.all(regions.map(async (region) => {
-    let prepared = region.edgeFallback
-      ? await createSafeCleanupLayer(image, region)
-      : await createCleanupLayer(image, region, width, height)
-    if (!prepared && !region.edgeFallback) prepared = await createSafeCleanupLayer(image, region)
+    let prepared = await createCleanupLayer(image, region, width, height)
+    if (!prepared) prepared = await createSafeCleanupLayer(image, region)
     if (!prepared) return null
     return [prepared.overlay, await createTextLayer(prepared.layout, width)]
   }))

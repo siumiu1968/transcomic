@@ -38,7 +38,7 @@ test('renderer preserves page dimensions and emits webp', async () => {
 })
 
 test('renderer translates an edge-clipped bubble without painting a panel-sized rectangle', async () => {
-  const source = Buffer.from('<svg width="600" height="900" xmlns="http://www.w3.org/2000/svg"><rect width="600" height="900" fill="#d7d0c6"/><ellipse cx="530" cy="705" rx="150" ry="190" fill="#fff" stroke="#111" stroke-width="5"/><rect x="458" y="648" width="65" height="26" fill="#111"/></svg>')
+  const source = Buffer.from('<svg width="600" height="900" xmlns="http://www.w3.org/2000/svg"><rect width="600" height="900" fill="#d7d0c6"/><ellipse cx="530" cy="705" rx="150" ry="190" fill="#fff" stroke="#111" stroke-width="5"/><rect x="458" y="648" width="65" height="26" fill="#111"/><rect x="435" y="600" width="8" height="10" fill="#111"/></svg>')
   const sourcePixel = await sharp(source).extract({ left: 465, top: 655, width: 1, height: 1 }).raw().toBuffer()
   assert.ok(sourcePixel[0] < 30)
   const output = await renderTranslation(source, {
@@ -52,8 +52,10 @@ test('renderer translates an edge-clipped bubble without painting a panel-sized 
     }],
   })
   const cleanedPixel = await sharp(output).extract({ left: 465, top: 655, width: 1, height: 1 }).raw().toBuffer()
+  const expandedPixel = await sharp(output).extract({ left: 438, top: 605, width: 1, height: 1 }).raw().toBuffer()
   const outsidePixel = await sharp(output).extract({ left: 300, top: 650, width: 1, height: 1 }).raw().toBuffer()
   assert.ok(cleanedPixel[0] > 200)
+  assert.ok(expandedPixel[0] > 200)
   assert.ok(outsidePixel[0] < 230)
 })
 
