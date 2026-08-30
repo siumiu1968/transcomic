@@ -32,7 +32,7 @@ export interface Chapter {
   language: string
   page_count: number
   translated_pages: number
-  status: 'ready' | 'queued' | 'translating' | 'completed' | 'failed'
+  status: 'ready' | 'queued' | 'translating' | 'completed' | 'failed' | 'needs_retranslation'
   updated_at: string
 }
 
@@ -57,4 +57,5 @@ export interface ReaderPage {
   status: string
   originalUrl: string
   translatedUrl: string | null
+  needsRetranslation?: boolean
 }

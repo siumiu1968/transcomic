@@ -17,6 +17,7 @@ interface PixelRegion extends PixelBox {
   safe: PixelBox
   text: string
   kind: 'speech' | 'narration'
+  edgeFallback: boolean
 }
 
 function escapeMarkup(value: string): string {
@@ -106,12 +107,11 @@ function toPixelRegion(region: TranslationRegion, imageWidth: number, imageHeigh
   const { x, y, width, height } = bubble
   if (width < 28 || height < 24) return null
   const edgeMargin = Math.max(4, Math.round(Math.min(imageWidth, imageHeight) * 0.006))
-  if (y < edgeMargin) return null
-  if (x + width > imageWidth * 0.97 || y + height > imageHeight * 0.97) return null
   if (safe.width < 18 || safe.height < 14) return null
   if (safe.x < x || safe.y < y || safe.x + safe.width > x + width || safe.y + safe.height > y + height) return null
   if (width > imageWidth * 0.65 && height < imageHeight * 0.08) return null
-  return { ...bubble, safe, text, kind: region.kind === 'narration' ? 'narration' : 'speech' }
+  const edgeFallback = x < edgeMargin || y < edgeMargin || x + width > imageWidth * 0.97 || y + height > imageHeight * 0.97
+  return { ...bubble, safe, text, kind: region.kind === 'narration' ? 'narration' : 'speech', edgeFallback }
 }
 
 async function createTextLayer(region: PixelRegion, imageWidth: number): Promise<{ input: Buffer; top: number; left: number }> {
@@ -334,6 +334,43 @@ async function createCleanupLayer(image: Buffer, region: PixelRegion, imageWidth
   }
 }
 
+async function createSafeCleanupLayer(image: Buffer, region: PixelRegion): Promise<{ overlay: { input: Buffer; top: number; left: number }; layout: PixelRegion } | null> {
+  const { x: left, y: top, width, height } = region.safe
+  const gray = await sharp(image)
+    .rotate()
+    .extract({ left, top, width, height })
+    .grayscale()
+    .extractChannel(0)
+    .raw()
+    .toBuffer()
+  const alpha = Buffer.alloc(width * height)
+  const dilation = Math.max(1, Math.round(Math.min(width, height) / 80))
+  let darkPixels = 0
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (gray[y * width + x] >= 190) continue
+      darkPixels += 1
+      for (let offsetY = -dilation; offsetY <= dilation; offsetY += 1) {
+        for (let offsetX = -dilation; offsetX <= dilation; offsetX += 1) {
+          if (offsetX * offsetX + offsetY * offsetY > dilation * dilation) continue
+          const targetX = x + offsetX
+          const targetY = y + offsetY
+          if (targetX >= 0 && targetX < width && targetY >= 0 && targetY < height) alpha[targetY * width + targetX] = 255
+        }
+      }
+    }
+  }
+  if (darkPixels === 0) return null
+  const input = await sharp({ create: { width, height, channels: 3, background: '#fffefb' } })
+    .joinChannel(alpha, { raw: { width, height, channels: 1 } })
+    .png()
+    .toBuffer()
+  return {
+    overlay: { input, top, left },
+    layout: { ...region, x: left, y: top, width, height },
+  }
+}
+
 export async function renderTranslation(image: Buffer, result: TranslationResult): Promise<Buffer> {
   const base = sharp(image).rotate()
   const metadata = await base.metadata()
@@ -345,7 +382,10 @@ export async function renderTranslation(image: Buffer, result: TranslationResult
   })
   if (regions.length === 0) return base.webp({ quality: 92 }).toBuffer()
   const renderedRegions = await Promise.all(regions.map(async (region) => {
-    const prepared = await createCleanupLayer(image, region, width, height)
+    let prepared = region.edgeFallback
+      ? await createSafeCleanupLayer(image, region)
+      : await createCleanupLayer(image, region, width, height)
+    if (!prepared && !region.edgeFallback) prepared = await createSafeCleanupLayer(image, region)
     if (!prepared) return null
     return [prepared.overlay, await createTextLayer(prepared.layout, width)]
   }))

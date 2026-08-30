@@ -5,7 +5,7 @@ import path from 'node:path'
 import test from 'node:test'
 import sharp from 'sharp'
 import { isAllowedSourceUrl } from './comix.js'
-import { Store } from './db.js'
+import { hasTranslationOutput, Store } from './db.js'
 import { balanceTranslationLines, normalizeDisplayText, renderTranslation } from './renderer.js'
 import { codexTimeoutForEffort, parseTranslationOutput } from './translator.js'
 
@@ -34,6 +34,42 @@ test('renderer preserves page dimensions and emits webp', async () => {
   assert.equal(metadata.height, 900)
   assert.equal(metadata.format, 'webp')
   const cleanedPixel = await sharp(output).extract({ left: 180, top: 280, width: 1, height: 1 }).raw().toBuffer()
+  assert.ok(cleanedPixel[0] > 200)
+})
+
+test('renderer translates an edge-clipped bubble without painting a panel-sized rectangle', async () => {
+  const source = Buffer.from('<svg width="600" height="900" xmlns="http://www.w3.org/2000/svg"><rect width="600" height="900" fill="#d7d0c6"/><ellipse cx="530" cy="705" rx="150" ry="190" fill="#fff" stroke="#111" stroke-width="5"/><rect x="458" y="648" width="65" height="26" fill="#111"/></svg>')
+  const sourcePixel = await sharp(source).extract({ left: 465, top: 655, width: 1, height: 1 }).raw().toBuffer()
+  assert.ok(sourcePixel[0] < 30)
+  const output = await renderTranslation(source, {
+    regions: [{
+      id: 1,
+      bubble: { x: 620, y: 570, width: 430, height: 430 },
+      safe: { x: 740, y: 680, width: 170, height: 220 },
+      source: 'My presence will endanger him.',
+      translation: '我會連累佢。',
+      kind: 'speech',
+    }],
+  })
+  const cleanedPixel = await sharp(output).extract({ left: 465, top: 655, width: 1, height: 1 }).raw().toBuffer()
+  const outsidePixel = await sharp(output).extract({ left: 300, top: 650, width: 1, height: 1 }).raw().toBuffer()
+  assert.ok(cleanedPixel[0] > 200)
+  assert.ok(outsidePixel[0] < 230)
+})
+
+test('renderer falls back to the safe text area when bubble detection cannot isolate an interior', async () => {
+  const source = Buffer.from('<svg width="600" height="900" xmlns="http://www.w3.org/2000/svg"><rect width="600" height="900" fill="#fff"/><rect x="250" y="365" width="100" height="10" fill="#111"/></svg>')
+  const output = await renderTranslation(source, {
+    regions: [{
+      id: 1,
+      bubble: { x: 250, y: 300, width: 500, height: 260 },
+      safe: { x: 400, y: 400, width: 200, height: 100 },
+      source: 'Hey old man',
+      translation: '喂，老伯！',
+      kind: 'speech',
+    }],
+  })
+  const cleanedPixel = await sharp(output).extract({ left: 270, top: 368, width: 1, height: 1 }).raw().toBuffer()
   assert.ok(cleanedPixel[0] > 200)
 })
 
@@ -89,6 +125,32 @@ test('store imports a series and chapters without duplicating them', () => {
     store.createJob({ id: 'job-1', chapter_id: 102, model: 'gpt-5.6-luna', reasoning_effort: 'max' })
     assert.equal(store.getJob('job-1')?.reasoning_effort, 'max')
     store.db.close()
+  } finally {
+    fs.rmSync(folder, { recursive: true, force: true })
+  }
+})
+
+test('legacy translated files without translation data are retained but marked for manual retry', () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'transcomic-legacy-test-'))
+  try {
+    const store = new Store(folder)
+    store.upsertSeries({
+      hid: 'legacy', title: '舊測試漫畫', altTitles: [], type: 'manga', status: 'releasing',
+      originalLanguage: 'ja', poster: {}, latestChapter: 1, synopsis: '', url: '/title/legacy',
+    })
+    store.upsertChapters('legacy', [{ id: 201, mangaId: 1, number: 1, volume: 1, name: '', language: 'ja', url: '/title/legacy/201' }])
+    store.upsertPages(201, [{ url: 'https://static.comix.to/page.webp', width: 600, height: 900 }])
+    store.updatePage(201, 1, { translated_path: 'media/201/translated/001.webp', status: 'completed' })
+    store.setChapterStatus(201, 'completed')
+    store.db.close()
+
+    const reopened = new Store(folder)
+    const page = reopened.listPages(201)[0]!
+    assert.equal(page.translated_path, 'media/201/translated/001.webp')
+    assert.equal(page.status, 'needs_retranslation')
+    assert.equal(hasTranslationOutput(page), false)
+    assert.equal(reopened.getChapter(201)?.status, 'needs_retranslation')
+    reopened.db.close()
   } finally {
     fs.rmSync(folder, { recursive: true, force: true })
   }

@@ -31,7 +31,7 @@ function synopsisText(value: string): string {
 function statusLabel(status: Chapter['status'] | Job['status']): string {
   return ({
     ready: '未翻譯', queued: '等候中', translating: '翻譯中', running: '翻譯中',
-    completed: '已完成', failed: '失敗', cancelled: '已取消',
+    completed: '已完成', failed: '失敗', cancelled: '已取消', needs_retranslation: '需要重譯',
   })[status] ?? status
 }
 

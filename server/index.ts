@@ -3,7 +3,7 @@ import path from 'node:path'
 import express, { type NextFunction, type Request, type Response } from 'express'
 import { config } from './config.js'
 import { ComixClient } from './comix.js'
-import { Store } from './db.js'
+import { hasTranslationOutput, Store } from './db.js'
 import { TranslationQueue } from './queue.js'
 import { MangaTranslator } from './translator.js'
 import type { TranslationMode } from './types.js'
@@ -102,9 +102,10 @@ app.get('/transcomic/api/chapters/:id/pages', asyncRoute(async (request, respons
     originalUrl: page.original_path
       ? `/transcomic/api/media/original/${chapterId}/${page.position}`
       : `/transcomic/api/source-image?chapterId=${chapterId}&position=${page.position}`,
-    translatedUrl: page.translated_path
+    translatedUrl: hasTranslationOutput(page)
       ? `/transcomic/api/media/translated/${chapterId}/${page.position}`
       : null,
+    needsRetranslation: page.status === 'needs_retranslation',
   }))
   response.json({ chapter, series: store.getSeries(chapter.series_hid), pages })
 }))

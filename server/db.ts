@@ -3,6 +3,10 @@ import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import type { ChapterRow, JobRow, PageRow, SeriesRow, SourceChapter, SourcePage, SourceSeries } from './types.js'
 
+export function hasTranslationOutput(page: Pick<PageRow, 'translated_path' | 'translation_json'>): boolean {
+  return Boolean(page.translated_path && page.translation_json.trim())
+}
+
 export class Store {
   readonly db: DatabaseSync
 
@@ -82,6 +86,21 @@ export class Store {
     this.db.prepare("UPDATE jobs SET status='queued', started_at='' WHERE status='running'").run()
     this.db.prepare("UPDATE chapters SET status='queued' WHERE status='translating'").run()
     this.db.prepare("UPDATE jobs SET model='gpt-5.6-luna', reasoning_effort='max' WHERE status='queued' AND model='gpt-5.6-sol'").run()
+    // A pre-region renderer could write a translated image without recording any
+    // translation output. Keep the file intact, but prevent it being presented as
+    // a real translation or silently skipped by a later manual retry.
+    this.db.prepare(`
+      UPDATE pages
+      SET status='needs_retranslation', error='舊版本未有翻譯資料，請手動重譯'
+      WHERE translated_path!='' AND TRIM(translation_json)='' AND status='completed'
+    `).run()
+    this.db.prepare(`
+      UPDATE chapters
+      SET status='needs_retranslation', updated_at=CURRENT_TIMESTAMP
+      WHERE status='completed' AND EXISTS (
+        SELECT 1 FROM pages WHERE pages.chapter_id=chapters.id AND pages.status='needs_retranslation'
+      )
+    `).run()
   }
 
   upsertSeries(series: SourceSeries): void {

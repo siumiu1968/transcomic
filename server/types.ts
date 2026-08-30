@@ -77,7 +77,7 @@ export interface ChapterRow {
   source_url: string
   page_count: number
   translated_pages: number
-  status: 'ready' | 'queued' | 'translating' | 'completed' | 'failed'
+  status: 'ready' | 'queued' | 'translating' | 'completed' | 'failed' | 'needs_retranslation'
   created_at: string
   updated_at: string
 }
@@ -91,7 +91,7 @@ export interface PageRow {
   width: number
   height: number
   scramble: number | null
-  status: 'pending' | 'translating' | 'completed' | 'failed'
+  status: 'pending' | 'translating' | 'completed' | 'failed' | 'needs_retranslation'
   error: string
   translation_json: string
 }
