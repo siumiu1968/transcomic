@@ -1,0 +1,39 @@
+{
+  "name": "transcomic",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k \"vite\" \"tsx watch server/index.ts\"",
+    "build": "vite build && tsc -p tsconfig.server.json",
+    "start": "node dist-server/index.js",
+    "lint": "oxlint src server",
+    "test": "tsx --test server/*.test.ts",
+    "check": "npm run lint && npm run test && npm run build"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "lucide-react": "^0.577.0",
+    "openai": "^6.27.0",
+    "patchright": "^1.58.2",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "sharp": "^0.35.4"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.13.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^6.1.0",
+    "concurrently": "^9.2.1",
+    "oxlint": "^1.79.0",
+    "tsx": "^4.21.0",
+    "typescript": "~6.0.2",
+    "vite": "^8.2.2"
+  },
+  "optionalDependencies": {
+    "@img/sharp-darwin-arm64": "0.35.4",
+    "@img/sharp-linux-arm64": "0.35.4"
+  }
+}

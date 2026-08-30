@@ -1,0 +1,36 @@
+:root {
+  font-family: "Noto Sans TC", "Noto Sans HK", "PingFang TC", system-ui, sans-serif;
+  color: #f4f1eb;
+  background: #090909;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  --bg: #090909;
+  --surface: #111111;
+  --surface-2: #171717;
+  --surface-3: #202020;
+  --border: #303030;
+  --border-soft: #242424;
+  --paper: #f4f1eb;
+  --muted: #a8a8a8;
+  --muted-2: #777777;
+  --accent: #e6322f;
+  --accent-hover: #f04440;
+  --success: #4fb879;
+  --warning: #d6a84b;
+  --danger: #ee625f;
+  --radius: 10px;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { min-width: 320px; min-height: 100%; margin: 0; }
+body { min-height: 100svh; overflow-x: hidden; }
+button, input { font: inherit; }
+button { color: inherit; }
+button:focus-visible, input:focus-visible { outline: 2px solid #ed6562; outline-offset: 2px; }
+button:disabled { cursor: not-allowed; opacity: .45; }
+img { display: block; max-width: 100%; }
+::selection { color: white; background: #b51e1c; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: #101010; }
+::-webkit-scrollbar-thumb { border: 3px solid #101010; border-radius: 10px; background: #454545; }
