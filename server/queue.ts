@@ -37,6 +37,9 @@ export class TranslationQueue {
   private readonly pending: string[] = []
   private readonly scheduled = new Set<string>()
   private running = false
+  private stopping = false
+  private drainTask?: Promise<void>
+  private stopTask?: Promise<void>
 
   constructor(
     private readonly store: Store,
@@ -46,6 +49,14 @@ export class TranslationQueue {
 
   start(): void {
     for (const job of this.store.queuedJobs()) this.schedule(job.id)
+  }
+
+  stop(): Promise<void> {
+    this.stopTask ??= (async () => {
+      this.stopping = true
+      await this.drainTask
+    })()
+    return this.stopTask
   }
 
   enqueue(chapterIds: number[], mode: TranslationMode, forceChapterIds: ReadonlySet<number> = new Set()): JobRow[] {
@@ -77,18 +88,21 @@ export class TranslationQueue {
   }
 
   private schedule(id: string, priority = false): void {
+    if (this.stopping) return
     if (this.scheduled.has(id)) return
     this.scheduled.add(id)
     if (priority) this.pending.unshift(id)
     else this.pending.push(id)
-    void this.drain()
+    this.drainTask ??= this.drain().finally(() => {
+      this.drainTask = undefined
+    })
   }
 
   private async drain(): Promise<void> {
     if (this.running) return
     this.running = true
     try {
-      while (this.pending.length > 0) {
+      while (!this.stopping && this.pending.length > 0) {
         const id = this.pending.shift()
         if (!id) continue
         this.scheduled.delete(id)
@@ -118,15 +132,27 @@ export class TranslationQueue {
       const currentChapterContext: string[] = []
       for (const page of pages) {
         activePosition = page.position
+        if (this.stopping) {
+          this.requeueAfterShutdown(job, chapter.id, activePosition)
+          return
+        }
         if (this.store.getJob(job.id)?.status === 'cancelled') return
         if (hasTranslationOutput(page)) {
           try {
             await fs.access(path.join(config.dataDir, page.translated_path))
+            if (this.stopping) {
+              this.requeueAfterShutdown(job, chapter.id, activePosition)
+              return
+            }
             if (this.store.getJob(job.id)?.status === 'cancelled') return
             currentChapterContext.push(page.translation_json)
             this.store.updateJob(job.id, { current_page: page.position })
             continue
           } catch {
+            if (this.stopping) {
+              this.requeueAfterShutdown(job, chapter.id, activePosition)
+              return
+            }
             this.store.updatePage(chapter.id, page.position, { translated_path: '', status: 'pending', error: '' })
           }
         }
@@ -163,6 +189,10 @@ export class TranslationQueue {
           width: metadata.width ?? page.width,
           height: metadata.height ?? page.height,
         })
+        if (this.stopping) {
+          this.requeueAfterShutdown(job, chapter.id, activePosition)
+          return
+        }
         const context = translationContext(
           [...priorChapterContext, ...currentChapterContext.slice(-2)],
           series?.title ?? job.series_title,
@@ -171,6 +201,10 @@ export class TranslationQueue {
         const translation = await this.translator.translate(original, job.model, job.reasoning_effort, context)
         const translationJson = JSON.stringify(translation)
         const rendered = await renderTranslationDetailed(original, translation)
+        if (this.stopping) {
+          this.requeueAfterShutdown(job, chapter.id, activePosition)
+          return
+        }
         if (this.store.getJob(job.id)?.status === 'cancelled') {
           this.store.updatePage(chapter.id, page.position, { status: 'pending', error: '' })
           return
@@ -188,6 +222,10 @@ export class TranslationQueue {
           continue
         }
         await atomicWrite(path.join(config.dataDir, translatedRelative), rendered.image)
+        if (this.stopping) {
+          this.requeueAfterShutdown(job, chapter.id, activePosition)
+          return
+        }
         if (this.store.getJob(job.id)?.status === 'cancelled') {
           this.store.updatePage(chapter.id, page.position, { status: 'pending', error: '' })
           return
@@ -201,6 +239,10 @@ export class TranslationQueue {
         currentChapterContext.push(translationJson)
         this.store.updateJob(job.id, { current_page: page.position })
       }
+      if (this.stopping) {
+        this.requeueAfterShutdown(job, chapter.id, activePosition)
+        return
+      }
       if (this.store.getJob(job.id)?.status === 'cancelled') return
       this.store.updateJob(job.id, {
         ...completionStatus(needsRetranslation),
@@ -209,6 +251,10 @@ export class TranslationQueue {
       })
       this.store.setChapterStatus(chapter.id, needsRetranslation ? 'needs_retranslation' : 'completed')
     } catch (error) {
+      if (this.stopping) {
+        this.requeueAfterShutdown(job, chapter.id, activePosition)
+        return
+      }
       const message = error instanceof Error ? error.message : '翻譯工作失敗'
       if (this.store.getJob(job.id)?.status !== 'cancelled') {
         if (activePosition > 0) this.store.updatePage(chapter.id, activePosition, { status: 'failed', error: message.slice(0, 500) })
@@ -216,5 +262,18 @@ export class TranslationQueue {
         this.store.setChapterStatus(chapter.id, 'failed')
       }
     }
+  }
+
+  private requeueAfterShutdown(job: JobRow, chapterId: number, activePosition: number): void {
+    const current = this.store.getJob(job.id)
+    if (!current || current.status === 'cancelled') return
+    if (activePosition > 0) {
+      const page = this.store.listPages(chapterId).find((item) => item.position === activePosition)
+      if (page?.status === 'translating' || page?.status === 'failed') {
+        this.store.updatePage(chapterId, activePosition, { status: 'pending', error: '' })
+      }
+    }
+    this.store.updateJob(job.id, { status: 'queued', started_at: '', error: '' })
+    this.store.setChapterStatus(chapterId, 'queued')
   }
 }

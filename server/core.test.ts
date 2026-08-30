@@ -5,8 +5,9 @@ import path from 'node:path'
 import test from 'node:test'
 import sharp from 'sharp'
 import { isAllowedSourceUrl } from './comix.js'
+import { config } from './config.js'
 import { hasTranslationOutput, Store } from './db.js'
-import { completionStatus } from './queue.js'
+import { completionStatus, TranslationQueue } from './queue.js'
 import { balanceTranslationLines, matchOcrLines, normalizeDisplayText, renderTranslation, renderTranslationDetailed } from './renderer.js'
 import { codexTimeoutForEffort, mergeTranslationResults, parseTranslationOutput, withAuditFallback } from './translator.js'
 
@@ -179,6 +180,55 @@ test('Max reasoning has enough time for dense manga pages', () => {
 test('a partially rendered chapter is not reported as a completed job', () => {
   assert.deepEqual(completionStatus(false), { status: 'completed', error: '' })
   assert.deepEqual(completionStatus(true), { status: 'failed', error: '部分頁面未能安全完成嵌字' })
+})
+
+test('stopping the queue requeues an interrupted active page', async () => {
+  const databaseFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'transcomic-shutdown-test-'))
+  const chapterId = 8_000_000_000 + process.pid
+  const mediaFolder = path.join(config.dataDir, 'media', String(chapterId))
+  const originalFolder = path.join(mediaFolder, 'original')
+  const originalPath = path.join(originalFolder, '001.webp')
+  const sourcePage = { url: 'https://static.comix.to/shutdown-test.webp', width: 120, height: 180, scramble: false }
+  const store = new Store(databaseFolder)
+  try {
+    store.upsertSeries({
+      hid: 'shutdown-test', title: '關閉測試', altTitles: [], type: 'manga', status: 'releasing',
+      originalLanguage: 'en', poster: {}, latestChapter: 1, synopsis: '', url: '/title/shutdown-test',
+    })
+    store.upsertChapters('shutdown-test', [{ id: chapterId, mangaId: 1, number: 1, volume: 1, name: '', language: 'en', url: '/title/shutdown-test/chapter-1' }])
+    store.upsertPages(chapterId, [sourcePage])
+    fs.mkdirSync(originalFolder, { recursive: true })
+    fs.writeFileSync(originalPath, await sharp({ create: { width: 120, height: 180, channels: 3, background: '#fff' } }).webp().toBuffer())
+    store.updatePage(chapterId, 1, { original_path: `media/${chapterId}/original/001.webp` })
+    store.createJob({ id: 'shutdown-job', chapter_id: chapterId, model: 'gpt-5.6-luna', reasoning_effort: 'max' })
+
+    let rejectTranslation: ((error: Error) => void) | undefined
+    let translationStarted: (() => void) | undefined
+    const started = new Promise<void>((resolve) => { translationStarted = resolve })
+    const translator = {
+      translate: () => new Promise((_, reject) => {
+        rejectTranslation = reject
+        translationStarted?.()
+      }),
+    } as unknown as ConstructorParameters<typeof TranslationQueue>[2]
+    const comix = {
+      getChapterPages: async () => [sourcePage],
+    } as unknown as ConstructorParameters<typeof TranslationQueue>[1]
+    const queue = new TranslationQueue(store, comix, translator)
+    queue.start()
+    await started
+    const stopped = queue.stop()
+    rejectTranslation?.(new Error('translation process stopped'))
+    await stopped
+
+    assert.equal(store.getJob('shutdown-job')?.status, 'queued')
+    assert.equal(store.listPages(chapterId)[0]?.status, 'pending')
+    assert.equal(store.getChapter(chapterId)?.status, 'queued')
+  } finally {
+    store.db.close()
+    fs.rmSync(databaseFolder, { recursive: true, force: true })
+    fs.rmSync(mediaFolder, { recursive: true, force: true })
+  }
 })
 
 test('store imports a series and chapters without duplicating them', () => {

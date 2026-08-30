@@ -210,11 +210,26 @@ const server = app.listen(config.port, config.host, () => {
   queue.start()
 })
 
-async function shutdown(): Promise<void> {
-  server.close()
-  await Promise.all([comix.close(), mediaComix.close()])
-  store.db.close()
+let shutdownTask: Promise<void> | undefined
+
+function shutdown(): Promise<void> {
+  shutdownTask ??= (async () => {
+    const closeServer = new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve())
+    })
+    await Promise.all([closeServer, queue.stop()])
+    await Promise.all([comix.close(), mediaComix.close()])
+    store.db.close()
+  })()
+  return shutdownTask
 }
 
-process.once('SIGINT', () => void shutdown())
-process.once('SIGTERM', () => void shutdown())
+function requestShutdown(): void {
+  void shutdown().catch((error: unknown) => {
+    console.error('[transcomic] 關閉失敗', error)
+    process.exitCode = 1
+  })
+}
+
+process.once('SIGINT', requestShutdown)
+process.once('SIGTERM', requestShutdown)
