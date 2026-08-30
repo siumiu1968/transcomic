@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowLeft, BookOpen, Columns2, Expand, GalleryVerticalEnd, Languages,
-  PanelLeftClose, PanelLeftOpen, RefreshCw, RotateCcw, ZoomIn, ZoomOut,
+  ImageOff, Images, LoaderCircle, PanelLeftClose, PanelLeftOpen, RefreshCw,
+  RotateCcw, ZoomIn, ZoomOut,
 } from 'lucide-react'
 import { api } from './api'
 import type { Chapter, ReaderPage, Series } from './types'
@@ -23,6 +24,45 @@ function chapterLabel(chapter: Chapter): string {
   return `第 ${Number.isInteger(chapter.number) ? chapter.number : chapter.number.toFixed(1)} 話`
 }
 
+function ReaderImage({ page, src, alt, eager, onAdvance }: { page: ReaderPage; src: string; alt: string; eager: boolean; onAdvance?: () => void }) {
+  const [state, setState] = useState<'loading' | 'ready' | 'error'>('loading')
+  const imageRef = useRef<HTMLImageElement>(null)
+  const aspectRatio = page.width > 0 && page.height > 0 ? `${page.width} / ${page.height}` : '2 / 3'
+
+  const retry = () => {
+    const image = imageRef.current
+    if (!image) return
+    setState('loading')
+    const url = new URL(src, location.href)
+    if (url.origin === location.origin) {
+      url.searchParams.set('_retry', String(Date.now()))
+      image.src = url.toString()
+      return
+    }
+    image.removeAttribute('src')
+    requestAnimationFrame(() => { image.src = src })
+  }
+
+  return (
+    <div id={`reader-page-${page.position}`} className={`reader-page-wrap is-${state}`} style={{ aspectRatio }}>
+      {state === 'loading' && <div className="image-state"><LoaderCircle className="spin" /><span>載入第 {page.position} 頁…</span></div>}
+      {state === 'error' && <div className="image-state image-error"><ImageOff /><span>第 {page.position} 頁載入失敗</span><button onClick={retry}>重試</button></div>}
+      <img
+        ref={imageRef}
+        key={src}
+        src={src}
+        width={page.width || undefined}
+        height={page.height || undefined}
+        loading={eager ? 'eager' : 'lazy'}
+        alt={alt}
+        onLoad={() => setState('ready')}
+        onError={() => setState('error')}
+        onClick={onAdvance}
+      />
+    </div>
+  )
+}
+
 export function Reader({ chapterId, onClose }: ReaderProps) {
   const [data, setData] = useState<ReaderData | null>(null)
   const [error, setError] = useState('')
@@ -31,7 +71,7 @@ export function Reader({ chapterId, onClose }: ReaderProps) {
   const [rtl, setRtl] = useState(true)
   const [zoom, setZoom] = useState(1)
   const [current, setCurrent] = useState(0)
-  const [sidebar, setSidebar] = useState(true)
+  const [sidebar, setSidebar] = useState(() => window.matchMedia('(min-width: 681px)').matches)
   const viewportRef = useRef<HTMLDivElement>(null)
 
   const load = useCallback(async () => {
@@ -55,10 +95,10 @@ export function Reader({ chapterId, onClose }: ReaderProps) {
     return layout === 'double' && rtl ? [...pages].reverse() : pages
   }, [current, data, layout, rtl, step])
 
-  const move = (direction: -1 | 1) => {
+  const move = useCallback((direction: -1 | 1) => {
     if (!data || layout === 'long') return
     setCurrent((value) => Math.max(0, Math.min(data.pages.length - 1, value + direction * step)))
-  }
+  }, [data, layout, step])
 
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
@@ -69,7 +109,7 @@ export function Reader({ chapterId, onClose }: ReaderProps) {
     }
     window.addEventListener('keydown', keydown)
     return () => window.removeEventListener('keydown', keydown)
-  })
+  }, [move, onClose, rtl])
 
   const jump = (position: number) => {
     setCurrent(position - 1)
@@ -112,7 +152,7 @@ export function Reader({ chapterId, onClose }: ReaderProps) {
       </header>
 
       <aside className="reader-sidebar">
-        <div className="sidebar-meta"><span>{data.pages.length} 頁</span><button onClick={() => setRtl((value) => !value)}>{rtl ? '右至左' : '左至右'}</button></div>
+        <div className="sidebar-meta"><span>{data.pages.length} 頁</span><div><button onClick={() => setRtl((value) => !value)}>{rtl ? '右至左' : '左至右'}</button><button className="sidebar-close" onClick={() => setSidebar(false)}>完成</button></div></div>
         <div className="thumbnail-list">
           {data.pages.map((page) => (
             <button key={page.position} className={current === page.position - 1 ? 'active' : ''} onClick={() => jump(page.position)}>
@@ -124,18 +164,18 @@ export function Reader({ chapterId, onClose }: ReaderProps) {
         </div>
       </aside>
 
+      {sidebar && <button className="reader-scrim" aria-label="關閉頁面列表" onClick={() => setSidebar(false)} />}
+
       <main ref={viewportRef} className={`reader-viewport layout-${layout}`} style={{ '--reader-zoom': zoom } as React.CSSProperties}>
         <div className="page-stage">
           {visiblePages.map((page) => (
-            <img
-              id={`reader-page-${page.position}`}
+            <ReaderImage
               key={`${page.position}-${translated}`}
+              page={page}
               src={displayUrl(page)}
-              width={page.width || undefined}
-              height={page.height || undefined}
-              loading={page.position <= 2 ? 'eager' : 'lazy'}
+              eager={page.position <= 2}
               alt={`${chapterLabel(data.chapter)}第 ${page.position} 頁`}
-              onClick={() => layout !== 'long' && move(1)}
+              onAdvance={layout !== 'long' ? () => move(1) : undefined}
             />
           ))}
         </div>
@@ -150,10 +190,10 @@ export function Reader({ chapterId, onClose }: ReaderProps) {
       )}
 
       <nav className="mobile-reader-bar">
-        <button onClick={() => setLayout((value) => value === 'long' ? 'single' : 'long')}>{layout === 'long' ? <BookOpen /> : <GalleryVerticalEnd />}<span>版面</span></button>
+        <button onClick={() => setSidebar(true)}><Images /><span>頁面</span></button>
+        <button onClick={() => setLayout((value) => value === 'long' ? 'single' : value === 'single' ? 'double' : 'long')}>{layout === 'long' ? <GalleryVerticalEnd /> : layout === 'single' ? <BookOpen /> : <Columns2 />}<span>{layout === 'long' ? '長條' : layout === 'single' ? '單頁' : '雙頁'}</span></button>
         <button className={translated ? 'active' : ''} onClick={() => setTranslated((value) => !value)}><Languages /><span>{translated ? '中文' : '原文'}</span></button>
         <button onClick={() => setZoom((value) => value >= 1.4 ? 0.8 : value + 0.2)}><ZoomIn /><span>{Math.round(zoom * 100)}%</span></button>
-        <button onClick={() => void load()}><RefreshCw /><span>整理</span></button>
       </nav>
     </div>
   )

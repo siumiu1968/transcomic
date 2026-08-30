@@ -5,7 +5,7 @@ import sharp from 'sharp'
 import { config } from './config.js'
 import type { Store } from './db.js'
 import type { ComixClient } from './comix.js'
-import type { MangaTranslator } from './translator.js'
+import { parseTranslationOutput, type MangaTranslator, type TranslationContext } from './translator.js'
 import type { JobRow, TranslationMode } from './types.js'
 import { renderTranslation } from './renderer.js'
 
@@ -14,6 +14,17 @@ async function atomicWrite(target: string, content: Buffer): Promise<void> {
   const temporary = `${target}.${process.pid}.${crypto.randomUUID()}.tmp`
   await fs.writeFile(temporary, content)
   await fs.rename(temporary, target)
+}
+
+function translationContext(values: string[], seriesTitle: string, synopsis: string): TranslationContext {
+  const previousRegions = values.flatMap((value) => {
+    try {
+      return parseTranslationOutput(value).regions.map(({ source, translation }) => ({ source, translation }))
+    } catch {
+      return []
+    }
+  })
+  return { seriesTitle, synopsis, previousRegions }
 }
 
 export class TranslationQueue {
@@ -31,8 +42,8 @@ export class TranslationQueue {
     for (const job of this.store.queuedJobs()) this.schedule(job.id)
   }
 
-  enqueue(chapterIds: number[], mode: TranslationMode): JobRow[] {
-    const model = this.translator.modelFor(mode)
+  enqueue(chapterIds: number[], mode: TranslationMode, forceChapterIds: ReadonlySet<number> = new Set()): JobRow[] {
+    const profile = this.translator.profileFor(mode)
     const jobs: JobRow[] = []
     for (const chapterId of chapterIds) {
       if (!this.store.getChapter(chapterId)) continue
@@ -41,11 +52,12 @@ export class TranslationQueue {
         jobs.push(active)
         continue
       }
+      if (forceChapterIds.has(chapterId)) this.store.resetChapterTranslation(chapterId)
       const id = crypto.randomUUID()
-      this.store.createJob({ id, chapter_id: chapterId, model })
+      this.store.createJob({ id, chapter_id: chapterId, model: profile.model, reasoning_effort: profile.effort })
       const job = this.store.getJob(id)
       if (job) jobs.push(job)
-      this.schedule(id)
+      this.schedule(id, forceChapterIds.has(chapterId))
     }
     return jobs
   }
@@ -58,10 +70,11 @@ export class TranslationQueue {
     return true
   }
 
-  private schedule(id: string): void {
+  private schedule(id: string, priority = false): void {
     if (this.scheduled.has(id)) return
     this.scheduled.add(id)
-    this.pending.push(id)
+    if (priority) this.pending.unshift(id)
+    else this.pending.push(id)
     void this.drain()
   }
 
@@ -93,10 +106,14 @@ export class TranslationQueue {
       this.store.upsertPages(chapter.id, sourcePages)
       this.store.updateJob(job.id, { total_pages: sourcePages.length })
       const pages = this.store.listPages(chapter.id)
+      const series = this.store.getSeries(chapter.series_hid)
+      const priorChapterContext = this.store.recentSeriesTranslationJson(chapter.series_hid, chapter.number, 2)
+      const currentChapterContext: string[] = []
       for (const page of pages) {
         activePosition = page.position
         if (this.store.getJob(job.id)?.status === 'cancelled') return
         if (page.status === 'completed' && page.translated_path) {
+          if (page.translation_json) currentChapterContext.push(page.translation_json)
           this.store.updateJob(job.id, { current_page: page.position })
           continue
         }
@@ -106,10 +123,24 @@ export class TranslationQueue {
         const translatedRelative = path.join(folder, 'translated', `${String(page.position).padStart(3, '0')}.webp`)
         const originalPath = path.join(config.dataDir, originalRelative)
         let original: Buffer
-        try {
-          original = await fs.readFile(originalPath)
-        } catch {
-          const download = await this.comix.downloadSource(page.source_url)
+        if (page.original_path) {
+          try {
+            original = await fs.readFile(originalPath)
+          } catch {
+            const download = await this.comix.downloadSource(page.source_url, {
+              chapterUrl: chapter.source_url,
+              pagePosition: page.position,
+              scramble: page.scramble === 1,
+            })
+            original = await sharp(download.body).rotate().webp({ quality: 92 }).toBuffer()
+            await atomicWrite(originalPath, original)
+          }
+        } else {
+          const download = await this.comix.downloadSource(page.source_url, {
+            chapterUrl: chapter.source_url,
+            pagePosition: page.position,
+            scramble: page.scramble === 1,
+          })
           original = await sharp(download.body).rotate().webp({ quality: 92 }).toBuffer()
           await atomicWrite(originalPath, original)
         }
@@ -119,14 +150,22 @@ export class TranslationQueue {
           width: metadata.width ?? page.width,
           height: metadata.height ?? page.height,
         })
-        const translation = await this.translator.translate(original, job.model)
+        const context = translationContext(
+          [...priorChapterContext, ...currentChapterContext.slice(-2)],
+          series?.title ?? job.series_title,
+          series?.synopsis ?? '',
+        )
+        const translation = await this.translator.translate(original, job.model, job.reasoning_effort, context)
         const rendered = await renderTranslation(original, translation)
         await atomicWrite(path.join(config.dataDir, translatedRelative), rendered)
+        const translationJson = JSON.stringify(translation)
         this.store.updatePage(chapter.id, page.position, {
           translated_path: translatedRelative,
+          translation_json: translationJson,
           status: 'completed',
           error: '',
         })
+        currentChapterContext.push(translationJson)
         this.store.updateJob(job.id, { current_page: page.position })
       }
       this.store.updateJob(job.id, { status: 'completed', current_page: sourcePages.length, finished_at: new Date().toISOString() })

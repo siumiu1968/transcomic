@@ -41,7 +41,8 @@ function parseId(raw: unknown): number {
 async function ensurePages(chapterId: number): Promise<void> {
   const chapter = store.getChapter(chapterId)
   if (!chapter) throw new Error('找不到章節')
-  if (store.listPages(chapterId).length > 0) return
+  const storedPages = store.listPages(chapterId)
+  if (storedPages.length > 0 && storedPages.every((page) => page.scramble === 0 || page.scramble === 1)) return
   const pages = await comix.getChapterPages({ id: chapter.id, url: chapter.source_url })
   if (pages.length === 0) throw new Error('章節未有可用圖片')
   store.upsertPages(chapterId, pages)
@@ -49,12 +50,13 @@ async function ensurePages(chapterId: number): Promise<void> {
 
 app.get('/transcomic/api/search', asyncRoute(async (request, response) => {
   const query = String(request.query.q ?? '').trim().slice(0, 100)
+  const searchPage = Math.max(1, Math.min(100, Number.parseInt(String(request.query.page ?? '1'), 10) || 1))
   if (query.length < 2) {
     response.json({ items: [] })
     return
   }
-  const result = await comix.search(query)
-  response.json({ items: result.items ?? [] })
+  const result = await comix.search(query, searchPage)
+  response.json({ items: result.items ?? [], meta: result.meta ?? {} })
 }))
 
 app.get('/transcomic/api/library', (_request, response) => {
@@ -98,7 +100,7 @@ app.get('/transcomic/api/chapters/:id/pages', asyncRoute(async (request, respons
     status: page.status,
     originalUrl: page.original_path
       ? `/transcomic/api/media/original/${chapterId}/${page.position}`
-      : `/transcomic/api/source-image?url=${encodeURIComponent(page.source_url)}`,
+      : `/transcomic/api/source-image?chapterId=${chapterId}&position=${page.position}`,
     translatedUrl: page.translated_path
       ? `/transcomic/api/media/translated/${chapterId}/${page.position}`
       : null,
@@ -107,8 +109,33 @@ app.get('/transcomic/api/chapters/:id/pages', asyncRoute(async (request, respons
 }))
 
 app.get('/transcomic/api/source-image', asyncRoute(async (request, response) => {
+  const chapterId = Number.parseInt(String(request.query.chapterId ?? ''), 10)
+  const position = Number.parseInt(String(request.query.position ?? ''), 10)
+  const page = Number.isSafeInteger(chapterId) && Number.isSafeInteger(position)
+    ? store.listPages(chapterId).find((item) => item.position === position)
+    : undefined
+  const chapter = page ? store.getChapter(chapterId) : undefined
   const sourceUrl = String(request.query.url ?? '')
-  const image = await comix.downloadSource(sourceUrl)
+  if (!page || !chapter) {
+    if (!sourceUrl) {
+      response.status(404).json({ error: '找不到來源頁面' })
+      return
+    }
+    const image = await comix.downloadSource(sourceUrl)
+    response.setHeader('Content-Type', image.contentType)
+    response.setHeader('Cache-Control', 'private, max-age=3600')
+    response.send(image.body)
+    return
+  }
+  if (!page.source_url) {
+    response.status(404).json({ error: '找不到來源頁面' })
+    return
+  }
+  const image = await comix.downloadSource(page.source_url, {
+    chapterUrl: chapter.source_url,
+    pagePosition: page.position,
+    scramble: page.scramble === 1,
+  })
   response.setHeader('Content-Type', image.contentType)
   response.setHeader('Cache-Control', 'private, max-age=3600')
   response.send(image.body)
@@ -129,19 +156,26 @@ app.get('/transcomic/api/media/:kind/:chapterId/:position', (request, response) 
     response.status(404).end()
     return
   }
-  response.setHeader('Cache-Control', 'private, max-age=31536000, immutable')
-  response.sendFile(target)
+  response.setHeader('Cache-Control', request.params.kind === 'translated'
+    ? 'private, max-age=0, must-revalidate'
+    : 'private, max-age=31536000, immutable')
+  response.sendFile(stored, { root: config.dataDir, dotfiles: 'deny' })
 })
 
 app.post('/transcomic/api/translate', (request, response) => {
   const rawIds = Array.isArray(request.body?.chapterIds) ? request.body.chapterIds : []
   const chapterIds = [...new Set<number>(rawIds.map((value: unknown) => Number(value)).filter((value: number) => Number.isSafeInteger(value) && value > 0))].slice(0, 5000)
+  const forceIds: unknown[] = Array.isArray(request.body?.forceChapterIds) ? request.body.forceChapterIds : []
+  const forceChapterIds = new Set<number>(forceIds.flatMap((value) => {
+    const id = Number(value)
+    return Number.isSafeInteger(id) && chapterIds.includes(id) ? [id] : []
+  }))
   const mode: TranslationMode = request.body?.mode === 'fast' || request.body?.mode === 'quality' ? request.body.mode : 'balanced'
   if (chapterIds.length === 0) {
     response.status(400).json({ error: '請先選擇章節' })
     return
   }
-  const jobs = queue.enqueue(chapterIds, mode)
+  const jobs = queue.enqueue(chapterIds, mode, forceChapterIds)
   response.status(202).json({ jobs })
 })
 

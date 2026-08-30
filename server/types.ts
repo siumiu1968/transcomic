@@ -30,15 +30,23 @@ export interface SourcePage {
   width: number
   height: number
   url: string
+  scramble?: boolean
 }
 
 export interface TranslationRegion {
+  id: number
+  bubble: TranslationBox
+  safe: TranslationBox
+  source: string
+  translation: string
+  kind: 'speech' | 'narration' | 'sfx'
+}
+
+export interface TranslationBox {
   x: number
   y: number
   width: number
   height: number
-  translation: string
-  kind: 'speech' | 'narration' | 'sfx'
 }
 
 export interface TranslationResult {
@@ -82,8 +90,10 @@ export interface PageRow {
   translated_path: string
   width: number
   height: number
+  scramble: number | null
   status: 'pending' | 'translating' | 'completed' | 'failed'
   error: string
+  translation_json: string
 }
 
 export interface JobRow {
@@ -93,6 +103,7 @@ export interface JobRow {
   series_title: string
   chapter_number: number
   model: string
+  reasoning_effort: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
   current_page: number
   total_pages: number

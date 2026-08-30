@@ -14,6 +14,7 @@ type TranslationMode = 'fast' | 'balanced' | 'quality'
 interface LibraryResponse { items: Series[] }
 interface SeriesResponse { series: Series; chapters: Chapter[] }
 interface JobsResponse { items: Job[] }
+interface SearchResponse { items: SearchSeries[]; meta?: { page?: number; lastPage?: number; hasNext?: boolean } }
 
 function chapterNumber(value: number): string {
   return Number.isInteger(value) ? String(value) : value.toFixed(1)
@@ -31,13 +32,30 @@ function Status({ value }: { value: Chapter['status'] | Job['status'] }) {
   return <span className={`status status-${value}`}>{icon}{statusLabel(value)}</span>
 }
 
+function Brand() {
+  return (
+    <div className="brand" aria-label="TransComic">
+      <svg className="brand-mark" viewBox="0 0 40 40" aria-hidden="true">
+        <path d="M8.5 6.5h20a3 3 0 0 1 3 3v17a3 3 0 0 1-3 3H19l-6.8 5v-5H8.5a3 3 0 0 1-3-3v-17a3 3 0 0 1 3-3Z" />
+        <path d="M20 7v22M7 17.8h12.8M20.2 21.4h10.6" />
+        <path className="brand-spark" d="m26.2 10.3.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9.9-2.1Z" />
+      </svg>
+      <strong>TransComic</strong>
+    </div>
+  )
+}
+
 function App() {
   const [library, setLibrary] = useState<Series[]>([])
   const [selectedHid, setSelectedHid] = useState('')
   const [seriesData, setSeriesData] = useState<SeriesResponse | null>(null)
   const [jobs, setJobs] = useState<Job[]>([])
   const [query, setQuery] = useState('')
+  const [searchedQuery, setSearchedQuery] = useState('')
   const [searchResults, setSearchResults] = useState<SearchSeries[]>([])
+  const [hasSearched, setHasSearched] = useState(false)
+  const [searchPage, setSearchPage] = useState(1)
+  const [searchHasNext, setSearchHasNext] = useState(false)
   const [searching, setSearching] = useState(false)
   const [importing, setImporting] = useState('')
   const [selectedChapters, setSelectedChapters] = useState<Set<number>>(new Set())
@@ -120,10 +138,31 @@ function App() {
     setSearching(true)
     setError('')
     try {
-      const response = await api<{ items: SearchSeries[] }>(`/search?q=${encodeURIComponent(query.trim())}`)
+      const response = await api<SearchResponse>(`/search?q=${encodeURIComponent(query.trim())}&page=1`)
       setSearchResults(response.items)
+      setSearchedQuery(query.trim())
+      setSearchPage(response.meta?.page ?? 1)
+      setSearchHasNext(response.meta?.hasNext ?? (response.meta?.lastPage ?? 1) > 1)
+      setHasSearched(true)
     } catch (searchError) {
       setError(searchError instanceof Error ? searchError.message : '搜尋失敗')
+    } finally {
+      setSearching(false)
+    }
+  }
+
+  const loadMoreSearch = async () => {
+    if (searching || !searchHasNext) return
+    setSearching(true)
+    setError('')
+    try {
+      const nextPage = searchPage + 1
+      const response = await api<SearchResponse>(`/search?q=${encodeURIComponent(searchedQuery)}&page=${nextPage}`)
+      setSearchResults((current) => [...new Map([...current, ...response.items].map((item) => [item.hid, item])).values()])
+      setSearchPage(response.meta?.page ?? nextPage)
+      setSearchHasNext(response.meta?.hasNext ?? (response.meta?.lastPage ?? nextPage) > nextPage)
+    } catch (searchError) {
+      setError(searchError instanceof Error ? searchError.message : '載入更多結果失敗')
     } finally {
       setSearching(false)
     }
@@ -137,6 +176,10 @@ function App() {
       await loadLibrary(result.hid)
       await loadSeries(result.hid)
       setSearchResults([])
+      setHasSearched(false)
+      setSearchedQuery('')
+      setSearchPage(1)
+      setSearchHasNext(false)
       setQuery('')
     } catch (importError) {
       setError(importError instanceof Error ? importError.message : '加入書庫失敗')
@@ -158,9 +201,12 @@ function App() {
     if (selectedChapters.size === 0) return
     setError('')
     try {
+      const forceChapterIds = (seriesData?.chapters ?? [])
+        .filter((chapter) => selectedChapters.has(chapter.id) && chapter.status === 'completed')
+        .map((chapter) => chapter.id)
       await api('/translate', {
         method: 'POST',
-        body: JSON.stringify({ chapterIds: [...selectedChapters], mode }),
+        body: JSON.stringify({ chapterIds: [...selectedChapters], forceChapterIds, mode }),
       })
       setSelectedChapters(new Set())
       await Promise.all([loadJobs(), selectedHid ? loadSeries(selectedHid) : Promise.resolve()])
@@ -175,27 +221,32 @@ function App() {
   const chapters = seriesData?.chapters ?? []
   const allSelected = chapters.length > 0 && chapters.every((chapter) => selectedChapters.has(chapter.id))
   const untranslated = chapters.filter((chapter) => chapter.status !== 'completed').map((chapter) => chapter.id)
+  const selectedCompleted = chapters.filter((chapter) => selectedChapters.has(chapter.id) && chapter.status === 'completed').length
 
   if (readerId) return <Reader chapterId={readerId} onClose={closeReader} />
 
   return (
     <div className="app-shell">
       <header className="app-header">
-        <div className="brand"><span className="brand-mark">譯</span><div><strong>TransComic</strong><small>漫譯</small></div></div>
+        <Brand />
         <form className="global-search" onSubmit={search}>
           <Search />
           <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜尋 Comix 漫畫…" aria-label="搜尋漫畫" />
-          {query && <button type="button" className="clear-search" onClick={() => { setQuery(''); setSearchResults([]) }}><X /></button>}
+          {query && <button type="button" className="clear-search" aria-label="清除搜尋" onClick={() => { setQuery(''); setSearchedQuery(''); setSearchResults([]); setHasSearched(false); setSearchPage(1); setSearchHasNext(false) }}><X /></button>}
           <button type="submit" disabled={searching || query.trim().length < 2}>{searching ? <LoaderCircle className="spin" /> : '搜尋'}</button>
         </form>
-        <div className="admin-chip"><ShieldCheck /><span>最高管理員</span></div>
+        <div className="header-actions">
+          <button className="queue-shortcut" onClick={() => document.getElementById('translation-queue')?.scrollIntoView({ behavior: 'smooth' })}><Download /><span>佇列</span><b>{activeJobs.length}</b></button>
+          <div className="admin-chip"><ShieldCheck /><span>最高管理員</span></div>
+        </div>
       </header>
 
       {error && <div className="error-banner"><CircleAlert /><span>{error}</span><button onClick={() => setError('')}><X /></button></div>}
 
-      {searchResults.length > 0 && (
+      {hasSearched && (
         <section className="search-drawer">
-          <div className="drawer-heading"><div><Search /><strong>搜尋結果</strong><span>{searchResults.length}</span></div><button className="icon-button" onClick={() => setSearchResults([])}><X /></button></div>
+          <div className="drawer-heading"><div><Search /><strong>搜尋結果</strong><span>{searchResults.length}</span></div><button className="icon-button" aria-label="關閉搜尋結果" onClick={() => { setSearchedQuery(''); setSearchResults([]); setHasSearched(false); setSearchPage(1); setSearchHasNext(false) }}><X /></button></div>
+          {searchResults.length === 0 ? <div className="search-empty"><BookOpen /><strong>搵唔到相關漫畫</strong><span>試吓輸入其他作品名稱。</span></div> : <>
           <div className="search-grid">
             {searchResults.map((result) => {
               const exists = library.some((item) => item.hid === result.hid)
@@ -211,13 +262,15 @@ function App() {
               )
             })}
           </div>
+          {searchHasNext && <div className="search-more-row"><button className="button" disabled={searching} onClick={() => void loadMoreSearch()}>{searching ? <LoaderCircle className="spin" /> : <Plus />}載入更多</button></div>}
+          </>}
         </section>
       )}
 
       <main className="workspace">
         <aside className="library-panel panel">
           <div className="panel-heading"><div><Library /><strong>我的書庫</strong><span>{library.length}</span></div><button className="icon-button" title="重新整理" onClick={() => void loadLibrary()}><RefreshCw /></button></div>
-          {loading ? <div className="panel-loading"><LoaderCircle className="spin" /></div> : library.length === 0 ? (
+          {loading ? <div className="library-skeleton" aria-label="載入書庫"><i /><i /><i /></div> : library.length === 0 ? (
             <div className="empty-state compact"><BookMarked /><strong>書庫未有漫畫</strong><span>喺上方搜尋並加入。</span></div>
           ) : (
             <div className="library-list">
@@ -256,10 +309,10 @@ function App() {
                 <div className="translate-actions">
                   <div className="segmented model-picker">
                     <button className={mode === 'fast' ? 'active' : ''} onClick={() => setMode('fast')} title="GPT-5.6 Luna">快速</button>
-                    <button className={mode === 'balanced' ? 'active' : ''} onClick={() => setMode('balanced')} title="GPT-5.6 Terra">平衡</button>
-                    <button className={mode === 'quality' ? 'active' : ''} onClick={() => setMode('quality')} title="GPT-5.6 Sol">精細</button>
+                    <button className={mode === 'balanced' ? 'active' : ''} onClick={() => setMode('balanced')} title="GPT-5.6 Luna">標準</button>
+                    <button className={mode === 'quality' ? 'active' : ''} onClick={() => setMode('quality')} title="GPT-5.6 Luna">最高品質</button>
                   </div>
-                  <button className="button primary translate-button" disabled={selectedChapters.size === 0} onClick={() => void startTranslation()}><Sparkles />開始翻譯</button>
+                  <button className="button primary translate-button" disabled={selectedChapters.size === 0} onClick={() => void startTranslation()}><Sparkles />{selectedCompleted === selectedChapters.size && selectedCompleted > 0 ? '重新翻譯' : '開始翻譯'}</button>
                 </div>
               </div>
 
@@ -280,7 +333,7 @@ function App() {
           )}
         </section>
 
-        <aside className="queue-panel panel">
+        <aside id="translation-queue" className="queue-panel panel">
           <div className="panel-heading"><div><Download /><strong>翻譯佇列</strong><span>{activeJobs.length}</span></div></div>
           {activeJobs.length === 0 ? (
             <div className="empty-state compact"><Pause /><strong>而家冇工作</strong><span>揀章節後開始翻譯。</span></div>

@@ -48,6 +48,7 @@ export class Store {
         translated_path TEXT NOT NULL DEFAULT '',
         width INTEGER NOT NULL DEFAULT 0,
         height INTEGER NOT NULL DEFAULT 0,
+        scramble INTEGER NOT NULL DEFAULT 0,
         status TEXT NOT NULL DEFAULT 'pending',
         error TEXT NOT NULL DEFAULT '',
         PRIMARY KEY(chapter_id, position)
@@ -66,8 +67,21 @@ export class Store {
       );
       CREATE INDEX IF NOT EXISTS jobs_status_created ON jobs(status, created_at);
     `)
+    const pageColumns = this.db.prepare('PRAGMA table_info(pages)').all() as unknown as Array<{ name: string }>
+    if (!pageColumns.some((column) => column.name === 'translation_json')) {
+      this.db.exec("ALTER TABLE pages ADD COLUMN translation_json TEXT NOT NULL DEFAULT ''")
+    }
+    if (!pageColumns.some((column) => column.name === 'scramble')) {
+      // NULL marks rows created before scramble metadata existed, so they are refreshed once.
+      this.db.exec('ALTER TABLE pages ADD COLUMN scramble INTEGER')
+    }
+    const jobColumns = this.db.prepare('PRAGMA table_info(jobs)').all() as unknown as Array<{ name: string }>
+    if (!jobColumns.some((column) => column.name === 'reasoning_effort')) {
+      this.db.exec("ALTER TABLE jobs ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'max'")
+    }
     this.db.prepare("UPDATE jobs SET status='queued', started_at='' WHERE status='running'").run()
     this.db.prepare("UPDATE chapters SET status='queued' WHERE status='translating'").run()
+    this.db.prepare("UPDATE jobs SET model='gpt-5.6-luna', reasoning_effort='max' WHERE status='queued' AND model='gpt-5.6-sol'").run()
   }
 
   upsertSeries(series: SourceSeries): void {
@@ -151,14 +165,20 @@ export class Store {
 
   upsertPages(chapterId: number, pages: SourcePage[]): void {
     const statement = this.db.prepare(`
-      INSERT INTO pages (chapter_id, position, source_url, width, height)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO pages (chapter_id, position, source_url, width, height, scramble)
+      VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(chapter_id, position) DO UPDATE SET
-        source_url=excluded.source_url, width=excluded.width, height=excluded.height
+        source_url=excluded.source_url, width=excluded.width, height=excluded.height,
+        scramble=excluded.scramble,
+        original_path=CASE WHEN excluded.scramble=1 AND COALESCE(pages.scramble, 0)=0 THEN '' ELSE original_path END,
+        translated_path=CASE WHEN excluded.scramble=1 AND COALESCE(pages.scramble, 0)=0 THEN '' ELSE translated_path END,
+        translation_json=CASE WHEN excluded.scramble=1 AND COALESCE(pages.scramble, 0)=0 THEN '' ELSE translation_json END,
+        status=CASE WHEN excluded.scramble=1 AND COALESCE(pages.scramble, 0)=0 THEN 'pending' ELSE status END,
+        error=CASE WHEN excluded.scramble=1 AND COALESCE(pages.scramble, 0)=0 THEN '' ELSE error END
     `)
     this.db.exec('BEGIN')
     try {
-      pages.forEach((page, index) => statement.run(chapterId, index + 1, page.url, page.width ?? 0, page.height ?? 0))
+      pages.forEach((page, index) => statement.run(chapterId, index + 1, page.url, page.width ?? 0, page.height ?? 0, page.scramble ? 1 : 0))
       this.db.prepare('DELETE FROM pages WHERE chapter_id=? AND position>?').run(chapterId, pages.length)
       this.db.prepare('UPDATE chapters SET page_count=?, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(pages.length, chapterId)
       this.db.exec('COMMIT')
@@ -172,7 +192,7 @@ export class Store {
     return this.db.prepare('SELECT * FROM pages WHERE chapter_id=? ORDER BY position').all(chapterId) as unknown as PageRow[]
   }
 
-  updatePage(chapterId: number, position: number, values: Partial<Pick<PageRow, 'original_path' | 'translated_path' | 'status' | 'error' | 'width' | 'height'>>): void {
+  updatePage(chapterId: number, position: number, values: Partial<Pick<PageRow, 'original_path' | 'translated_path' | 'status' | 'error' | 'width' | 'height' | 'translation_json'>>): void {
     const entries = Object.entries(values)
     if (entries.length === 0) return
     const fields = entries.map(([key]) => `${key}=?`).join(', ')
@@ -183,9 +203,31 @@ export class Store {
     this.db.prepare('UPDATE chapters SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(status, id)
   }
 
-  createJob(job: Pick<JobRow, 'id' | 'chapter_id' | 'model'>): void {
-    this.db.prepare('INSERT INTO jobs (id, chapter_id, model) VALUES (?, ?, ?)').run(job.id, job.chapter_id, job.model)
+  resetChapterTranslation(id: number): void {
+    this.db.exec('BEGIN')
+    try {
+      this.db.prepare("UPDATE pages SET translated_path='', translation_json='', status='pending', error='' WHERE chapter_id=?").run(id)
+      this.setChapterStatus(id, 'ready')
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  createJob(job: Pick<JobRow, 'id' | 'chapter_id' | 'model' | 'reasoning_effort'>): void {
+    this.db.prepare('INSERT INTO jobs (id, chapter_id, model, reasoning_effort) VALUES (?, ?, ?, ?)').run(job.id, job.chapter_id, job.model, job.reasoning_effort)
     this.setChapterStatus(job.chapter_id, 'queued')
+  }
+
+  recentSeriesTranslationJson(seriesHid: string, beforeChapterNumber: number, limit = 2): string[] {
+    const rows = this.db.prepare(`
+      SELECT p.translation_json
+      FROM pages p JOIN chapters c ON c.id=p.chapter_id
+      WHERE c.series_hid=? AND c.number<? AND p.translation_json!=''
+      ORDER BY c.number DESC, p.position DESC LIMIT ?
+    `).all(seriesHid, beforeChapterNumber, limit) as unknown as Array<{ translation_json: string }>
+    return rows.reverse().map((row) => row.translation_json)
   }
 
   activeJobForChapter(chapterId: number): JobRow | undefined {

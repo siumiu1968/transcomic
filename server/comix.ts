@@ -8,7 +8,25 @@ interface Paged<T> {
 }
 
 interface ChapterPayload extends SourceChapter {
-  pages?: { baseUrl?: string; items?: SourcePage[] }
+  pages?: { baseUrl?: string; items?: Array<SourcePage & { s?: number }> }
+}
+
+export interface SourceImageRequest {
+  chapterUrl?: string
+  pagePosition?: number
+  scramble?: boolean
+}
+
+const COMIX_SEARCH_PAGE_SIZE = 28
+
+export function buildComixSearchParams(query: string, page = 1) {
+  return {
+    keyword: query.trim(),
+    page,
+    limit: COMIX_SEARCH_PAGE_SIZE,
+    content_rating: ['safe', 'suggestive'],
+    order: { relevance: 'desc' },
+  }
 }
 
 export function isAllowedSourceUrl(rawUrl: string): boolean {
@@ -65,14 +83,15 @@ export class ComixClient {
     return href
   }
 
-  async search(query: string): Promise<Paged<SourceSeries>> {
+  async search(query: string, searchPage = 1): Promise<Paged<SourceSeries>> {
     return this.locked(async () => {
       const { page } = await this.ready()
       const href = await this.moduleHref(page)
-      return page.evaluate(async ({ href, query }) => {
+      const params = buildComixSearchParams(query, searchPage)
+      return page.evaluate(async ({ href, params }) => {
         const client = await import(href)
-        return client.c.list({ keyword: query, limit: 12 })
-      }, { href, query }) as Promise<Paged<SourceSeries>>
+        return client.c.list(params)
+      }, { href, params }) as Promise<Paged<SourceSeries>>
     })
   }
 
@@ -127,19 +146,47 @@ export class ComixClient {
       }, { href, chapterId: chapter.id }) as ChapterPayload
       const baseUrl = payload.pages?.baseUrl ?? ''
       const items = payload.pages?.items ?? []
-      return items.map((item) => ({ ...item, url: new URL(item.url, baseUrl || 'https://comix.to').toString() }))
+      return items.map((item) => ({
+        ...item,
+        scramble: item.s === 1,
+        url: new URL(item.url, baseUrl || 'https://comix.to').toString(),
+      }))
     })
   }
 
-  async downloadSource(rawUrl: string): Promise<{ body: Buffer; contentType: string }> {
+  async downloadSource(rawUrl: string, request: SourceImageRequest = {}): Promise<{ body: Buffer; contentType: string }> {
     if (!isAllowedSourceUrl(rawUrl)) throw new Error('圖片來源網域不受信任')
-    const { context } = await this.locked(() => this.ready())
-    const response = await context.request.get(rawUrl, {
-      headers: { Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8', Referer: 'https://comix.to/' },
-      timeout: 90_000,
+    return this.locked(async () => {
+      const { context, page } = await this.ready()
+      if (!request.scramble) {
+        const response = await context.request.get(rawUrl, {
+          headers: { Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8', Referer: 'https://comix.to/' },
+          timeout: 90_000,
+        })
+        if (!response.ok()) throw new Error(`圖片下載失敗 (${response.status()})`)
+        return { body: Buffer.from(await response.body()), contentType: response.headers()['content-type'] ?? 'image/webp' }
+      }
+      const chapterUrl = request.chapterUrl
+      const pagePosition = request.pagePosition
+      if (!chapterUrl?.startsWith('/title/') || typeof pagePosition !== 'number' || !Number.isInteger(pagePosition) || pagePosition < 1) {
+        throw new Error('亂序圖片缺少章節定位資料')
+      }
+      const chapterHref = new URL(chapterUrl, 'https://comix.to')
+      if (new URL(page.url()).pathname !== chapterHref.pathname) await this.navigate(page, chapterHref.toString())
+      const pageSelector = `.rpage-page[data-page="${pagePosition}"] canvas`
+      await page.waitForSelector(`[aria-label="Go to page ${pagePosition}"]`, { timeout: 90_000 })
+      await page.locator(`[aria-label="Go to page ${pagePosition}"]`).click()
+      await page.waitForSelector(pageSelector, { timeout: 90_000 })
+      await page.waitForTimeout(250)
+      const dataUrl = await page.evaluate((selector) => {
+        const canvas = document.querySelector<HTMLCanvasElement>(selector)
+        if (!canvas || canvas.width === 0 || canvas.height === 0) throw new Error('原站未產生還原圖片')
+        return canvas.toDataURL('image/png')
+      }, pageSelector)
+      const match = /^data:image\/png;base64,([A-Za-z0-9+/=]+)$/.exec(dataUrl)
+      if (!match) throw new Error('原站還原圖片格式無效')
+      return { body: Buffer.from(match[1], 'base64'), contentType: 'image/png' }
     })
-    if (!response.ok()) throw new Error(`圖片下載失敗 (${response.status()})`)
-    return { body: Buffer.from(await response.body()), contentType: response.headers()['content-type'] ?? 'image/webp' }
   }
 
   async close(): Promise<void> {

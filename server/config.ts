@@ -12,6 +12,14 @@ function integer(name: string, fallback: number): number {
   return Number.isFinite(value) ? value : fallback
 }
 
+const reasoningEfforts = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+export type ReasoningEffort = typeof reasoningEfforts[number]
+
+function reasoningEffort(name: string, fallback: ReasoningEffort): ReasoningEffort {
+  const value = process.env[name]
+  return reasoningEfforts.includes(value as ReasoningEffort) ? value as ReasoningEffort : fallback
+}
+
 export const config = {
   host: process.env.HOST ?? '127.0.0.1',
   port: integer('PORT', 4178),
@@ -24,8 +32,11 @@ export const config = {
   browserExecutablePath: process.env.PATCHRIGHT_EXECUTABLE_PATH,
   browserHeadless: process.env.BROWSER_HEADLESS !== '0',
   modelFast: process.env.TRANSLATION_MODEL_FAST ?? 'gpt-5.6-luna',
-  modelBalanced: process.env.TRANSLATION_MODEL_BALANCED ?? 'gpt-5.6-terra',
-  modelQuality: process.env.TRANSLATION_MODEL_QUALITY ?? 'gpt-5.6-sol',
+  modelBalanced: process.env.TRANSLATION_MODEL_BALANCED ?? 'gpt-5.6-luna',
+  modelQuality: process.env.TRANSLATION_MODEL_QUALITY ?? 'gpt-5.6-luna',
+  effortFast: reasoningEffort('TRANSLATION_EFFORT_FAST', 'low'),
+  effortBalanced: reasoningEffort('TRANSLATION_EFFORT_BALANCED', 'high'),
+  effortQuality: reasoningEffort('TRANSLATION_EFFORT_QUALITY', 'max'),
   maxImageEdge: integer('MAX_IMAGE_EDGE', 2048),
   translationBackend: process.env.TRANSLATION_BACKEND ?? 'openai',
   codexCliPath: process.env.CODEX_CLI_PATH ?? 'codex',
