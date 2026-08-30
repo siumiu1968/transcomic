@@ -15,6 +15,16 @@ export interface OcrWord {
 export interface OcrHint {
   text: string
   box: TranslationBox
+  confidence?: number
+}
+
+function median(values: number[]): number {
+  if (values.length === 0) return 0
+  const sorted = [...values].sort((left, right) => left - right)
+  const middle = Math.floor(sorted.length / 2)
+  return sorted.length % 2 === 0
+    ? ((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2
+    : (sorted[middle] ?? 0)
 }
 
 const tesseractWaiters: Array<() => void> = []
@@ -130,6 +140,11 @@ export function buildOcrHints(words: OcrWord[], imageWidth: number, imageHeight:
     const top = Math.min(...sorted.map((word) => word.y))
     const right = Math.max(...sorted.map((word) => word.x + word.width))
     const bottom = Math.max(...sorted.map((word) => word.y + word.height))
+    // A stylised word can be recognised very confidently while adjacent
+    // punctuation/noise is not. Use the reliable core instead of averaging
+    // all words and accidentally hiding that clear OCR signal.
+    const confidences = sorted.map((word) => word.confidence)
+    const reliableCore = confidences.filter((confidence) => confidence >= 60)
     return [{
       text,
       box: {
@@ -138,6 +153,7 @@ export function buildOcrHints(words: OcrWord[], imageWidth: number, imageHeight:
         width: Math.max(1, Math.round((right - left) / Math.max(1, imageWidth) * 1000)),
         height: Math.max(1, Math.round((bottom - top) / Math.max(1, imageHeight) * 1000)),
       },
+      confidence: Math.round(median(reliableCore.length > 0 ? reliableCore : confidences)),
     }]
   }).sort((left, right) => left.box.y - right.box.y || right.box.x - left.box.x).slice(0, 120)
 }

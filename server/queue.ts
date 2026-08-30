@@ -5,8 +5,8 @@ import sharp from 'sharp'
 import { config } from './config.js'
 import { hasTranslationOutput, type Store } from './db.js'
 import type { ComixClient } from './comix.js'
-import { parseTranslationOutput, type MangaTranslator, type TranslationContext } from './translator.js'
-import type { JobRow, TranslationMode } from './types.js'
+import { isTranslationCompletenessError, parseTranslationOutput, type MangaTranslator, type TranslationContext } from './translator.js'
+import type { JobRow, TranslationMode, TranslationResult } from './types.js'
 import { renderTranslationDetailed } from './renderer.js'
 
 async function atomicWrite(target: string, content: Buffer): Promise<void> {
@@ -36,16 +36,22 @@ export function completionStatus(needsRetranslation: boolean): Pick<JobRow, 'sta
 export class TranslationQueue {
   private readonly pending: string[] = []
   private readonly scheduled = new Set<string>()
-  private running = false
+  private readonly activeTasks = new Set<Promise<void>>()
+  private readonly activeChapterIds = new Set<number>()
+  private readonly workerLimit: number
   private stopping = false
   private drainTask?: Promise<void>
   private stopTask?: Promise<void>
+  private wakeDrain?: () => void
 
   constructor(
     private readonly store: Store,
     private readonly comix: ComixClient,
     private readonly translator: MangaTranslator,
-  ) {}
+    concurrency = config.translationChapterConcurrency,
+  ) {
+    this.workerLimit = Number.isSafeInteger(concurrency) && concurrency > 0 ? Math.min(concurrency, 4) : 1
+  }
 
   start(): void {
     for (const job of this.store.queuedJobs()) this.schedule(job.id)
@@ -54,6 +60,7 @@ export class TranslationQueue {
   stop(): Promise<void> {
     this.stopTask ??= (async () => {
       this.stopping = true
+      this.wakeDrain?.()
       await this.drainTask
     })()
     return this.stopTask
@@ -93,25 +100,79 @@ export class TranslationQueue {
     this.scheduled.add(id)
     if (priority) this.pending.unshift(id)
     else this.pending.push(id)
-    this.drainTask ??= this.drain().finally(() => {
+    this.ensureDrain()
+    this.wakeDrain?.()
+  }
+
+  private ensureDrain(): void {
+    if (this.stopping || this.drainTask) return
+    // Start on the next microtask so a batch enqueue can fill all workers at once.
+    this.drainTask = Promise.resolve().then(() => this.drain()).finally(() => {
       this.drainTask = undefined
+      // A request can enqueue work while the previous drain promise is settling.
+      if (!this.stopping && this.pending.length > 0) this.ensureDrain()
     })
   }
 
   private async drain(): Promise<void> {
-    if (this.running) return
-    this.running = true
-    try {
-      while (!this.stopping && this.pending.length > 0) {
-        const id = this.pending.shift()
-        if (!id) continue
-        this.scheduled.delete(id)
-        const job = this.store.getJob(id)
-        if (job?.status === 'queued') await this.process(job)
+    while (true) {
+      if (this.stopping) {
+        await Promise.allSettled([...this.activeTasks])
+        return
       }
-    } finally {
-      this.running = false
+
+      while (this.activeTasks.size < this.workerLimit) {
+        const job = this.takeNextEligibleJob()
+        if (!job) break
+        this.startJob(job)
+      }
+
+      if (this.activeTasks.size === 0) return
+      await this.waitForWorkerOrSchedule()
     }
+  }
+
+  private async waitForWorkerOrSchedule(): Promise<void> {
+    let wake = () => {}
+    const scheduled = new Promise<void>((resolve) => { wake = resolve })
+    this.wakeDrain = wake
+    try {
+      await Promise.race([
+        scheduled,
+        ...[...this.activeTasks].map((task) => task.catch(() => undefined)),
+      ])
+    } finally {
+      if (this.wakeDrain === wake) this.wakeDrain = undefined
+    }
+  }
+
+  private takeNextEligibleJob(): JobRow | undefined {
+    for (let index = 0; index < this.pending.length;) {
+      const id = this.pending[index]
+      const job = id ? this.store.getJob(id) : undefined
+      if (!job || job.status !== 'queued') {
+        this.pending.splice(index, 1)
+        if (id) this.scheduled.delete(id)
+        continue
+      }
+      if (this.activeChapterIds.has(job.chapter_id)) {
+        index += 1
+        continue
+      }
+      this.pending.splice(index, 1)
+      this.scheduled.delete(job.id)
+      return job
+    }
+    return undefined
+  }
+
+  private startJob(job: JobRow): void {
+    this.activeChapterIds.add(job.chapter_id)
+    const task = this.process(job).finally(() => {
+      this.activeTasks.delete(task)
+      this.activeChapterIds.delete(job.chapter_id)
+    })
+    this.activeTasks.add(task)
   }
 
   private async process(job: JobRow): Promise<void> {
@@ -198,7 +259,31 @@ export class TranslationQueue {
           series?.title ?? job.series_title,
           series?.synopsis ?? '',
         )
-        const translation = await this.translator.translate(original, job.model, job.reasoning_effort, context)
+        let translation: TranslationResult
+        try {
+          translation = await this.translator.translate(original, job.model, job.reasoning_effort, context)
+        } catch (error) {
+          if (!isTranslationCompletenessError(error)) throw error
+          if (this.stopping) {
+            this.requeueAfterShutdown(job, chapter.id, activePosition)
+            return
+          }
+          if (this.store.getJob(job.id)?.status === 'cancelled') {
+            this.store.updatePage(chapter.id, page.position, { status: 'pending', error: '' })
+            return
+          }
+          const partialJson = JSON.stringify(error.partialResult)
+          needsRetranslation = true
+          this.store.updatePage(chapter.id, page.position, {
+            translated_path: '',
+            translation_json: partialJson,
+            status: 'needs_retranslation',
+            error: `尚有 ${error.unresolvedHints.length} 個高信心英文區域未翻譯，請重譯`,
+          })
+          currentChapterContext.push(partialJson)
+          this.store.updateJob(job.id, { current_page: page.position })
+          continue
+        }
         const translationJson = JSON.stringify(translation)
         const rendered = await renderTranslationDetailed(original, translation)
         if (this.stopping) {

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   BookMarked, BookOpen, Check, ChevronRight, CircleAlert, Clock3, Download,
   Languages, Library, LoaderCircle, Pause, Play, Plus, RefreshCw, Search,
@@ -35,6 +35,10 @@ function statusLabel(status: Chapter['status'] | Job['status']): string {
   })[status] ?? status
 }
 
+function seriesStatusLabel(status?: string): string {
+  return ({ releasing: '連載中', finished: '已完結', on_hiatus: '休刊中', cancelled: '已取消' })[status ?? ''] ?? status ?? '未知狀態'
+}
+
 function Status({ value }: { value: Chapter['status'] | Job['status'] }) {
   const icon = value === 'completed' ? <Check /> : value === 'failed' ? <CircleAlert /> : value === 'running' || value === 'translating' ? <LoaderCircle className="spin" /> : value === 'queued' ? <Clock3 /> : null
   return <span className={`status status-${value}`}>{icon}{statusLabel(value)}</span>
@@ -43,12 +47,13 @@ function Status({ value }: { value: Chapter['status'] | Job['status'] }) {
 function Brand() {
   return (
     <div className="brand" aria-label="TransComic">
-      <svg className="brand-mark" viewBox="0 0 40 40" aria-hidden="true">
-        <path d="M8.5 6.5h20a3 3 0 0 1 3 3v17a3 3 0 0 1-3 3H19l-6.8 5v-5H8.5a3 3 0 0 1-3-3v-17a3 3 0 0 1 3-3Z" />
-        <path d="M20 7v22M7 17.8h12.8M20.2 21.4h10.6" />
-        <path className="brand-spark" d="m26.2 10.3.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9.9-2.1Z" />
+      <svg className="brand-mark" viewBox="0 0 44 44" aria-hidden="true">
+        <path className="brand-page" d="M4.5 10.2c6.6-2.1 12.2-1 17.5 2.4v25.1c-5.4-3.6-11.2-4.5-17.5-2.3V10.2Z" />
+        <path className="brand-page" d="M39.5 10.2c-6.6-2.1-12.2-1-17.5 2.4v25.1c5.4-3.6 11.2-4.5 17.5-2.3V10.2Z" />
+        <path className="brand-line" d="M8.5 15.1c3.3-.5 6.4 0 9.3 1.5M8.5 20.2c3.3-.5 6.4 0 9.3 1.5M26.2 24.8c2.9-1.5 6-2 9.3-1.5" />
+        <path className="brand-spark" d="M31.1 11.5c.6 2 1.7 3.1 3.7 3.7-2 .6-3.1 1.7-3.7 3.7-.6-2-1.7-3.1-3.7-3.7 2-.6 3.1-1.7 3.7-3.7Z" />
       </svg>
-      <strong>TransComic</strong>
+      <strong><span>Trans</span>Comic</strong>
     </div>
   )
 }
@@ -64,6 +69,8 @@ function App() {
   const [hasSearched, setHasSearched] = useState(false)
   const [searchPage, setSearchPage] = useState(1)
   const [searchHasNext, setSearchHasNext] = useState(false)
+  const [searchLanguage, setSearchLanguage] = useState('all')
+  const [searchStatus, setSearchStatus] = useState('all')
   const [searching, setSearching] = useState(false)
   const [importing, setImporting] = useState('')
   const [selectedChapters, setSelectedChapters] = useState<Set<number>>(new Set())
@@ -151,6 +158,8 @@ function App() {
       setSearchedQuery(query.trim())
       setSearchPage(response.meta?.page ?? 1)
       setSearchHasNext(response.meta?.hasNext ?? (response.meta?.lastPage ?? 1) > 1)
+      setSearchLanguage('all')
+      setSearchStatus('all')
       setHasSearched(true)
     } catch (searchError) {
       setError(searchError instanceof Error ? searchError.message : '搜尋失敗')
@@ -230,6 +239,12 @@ function App() {
   const allSelected = chapters.length > 0 && chapters.every((chapter) => selectedChapters.has(chapter.id))
   const untranslated = chapters.filter((chapter) => chapter.status !== 'completed').map((chapter) => chapter.id)
   const selectedCompleted = chapters.filter((chapter) => selectedChapters.has(chapter.id) && chapter.status === 'completed').length
+  const searchLanguages = useMemo(() => [...new Set(searchResults.map((item) => item.originalLanguage?.toUpperCase()).filter(Boolean) as string[])].sort(), [searchResults])
+  const searchStatuses = useMemo(() => [...new Set(searchResults.map((item) => item.status).filter(Boolean))].sort(), [searchResults])
+  const visibleSearchResults = useMemo(() => searchResults.filter((item) => (
+    (searchLanguage === 'all' || item.originalLanguage?.toUpperCase() === searchLanguage)
+    && (searchStatus === 'all' || item.status === searchStatus)
+  )), [searchLanguage, searchResults, searchStatus])
 
   if (readerId) return <Reader chapterId={readerId} onClose={closeReader} />
 
@@ -253,23 +268,35 @@ function App() {
 
       {hasSearched && (
         <section className="search-drawer">
-          <div className="drawer-heading"><div><Search /><strong>搜尋結果</strong><span>{searchResults.length}</span></div><button className="icon-button" aria-label="關閉搜尋結果" onClick={() => { setSearchedQuery(''); setSearchResults([]); setHasSearched(false); setSearchPage(1); setSearchHasNext(false) }}><X /></button></div>
+          <div className="drawer-heading">
+            <div className="search-heading-copy"><Search /><span><strong>「{searchedQuery}」搜尋結果</strong><small>{visibleSearchResults.length === searchResults.length ? `${searchResults.length} 套漫畫` : `顯示 ${visibleSearchResults.length} / ${searchResults.length} 套`}</small></span></div>
+            <div className="search-filters">
+              <label><span>語言</span><select aria-label="按原文語言篩選" value={searchLanguage} onChange={(event) => setSearchLanguage(event.target.value)}><option value="all">全部</option>{searchLanguages.map((language) => <option key={language} value={language}>{language}</option>)}</select></label>
+              <label><span>狀態</span><select aria-label="按連載狀態篩選" value={searchStatus} onChange={(event) => setSearchStatus(event.target.value)}><option value="all">全部</option>{searchStatuses.map((status) => <option key={status} value={status}>{seriesStatusLabel(status)}</option>)}</select></label>
+              <button className="icon-button" aria-label="關閉搜尋結果" onClick={() => { setSearchedQuery(''); setSearchResults([]); setHasSearched(false); setSearchPage(1); setSearchHasNext(false) }}><X /></button>
+            </div>
+          </div>
           {searchResults.length === 0 ? <div className="search-empty"><BookOpen /><strong>搵唔到相關漫畫</strong><span>試吓輸入其他作品名稱。</span></div> : <>
           <div className="search-grid">
-            {searchResults.map((result) => {
+            {visibleSearchResults.map((result) => {
               const exists = library.some((item) => item.hid === result.hid)
               const poster = result.poster?.large ?? result.poster?.medium
               return (
                 <article key={result.hid} className="search-card">
-                  <div className="cover"><img src={sourceImage(poster)} alt="" /></div>
-                  <div><strong>{result.title}</strong><span>{result.originalLanguage?.toUpperCase()} · {result.status}</span><small>最新第 {result.latestChapter || '—'} 話</small></div>
-                  <button className={`button ${exists ? '' : 'primary'}`} disabled={exists || importing === result.hid} onClick={() => void importSeries(result)}>
+                  <div className="cover">{poster ? <img src={sourceImage(poster)} alt={`${result.title}封面`} loading="lazy" /> : <BookOpen aria-hidden="true" />}</div>
+                  <div className="search-card-body">
+                    <strong title={result.title}>{result.title}</strong>
+                    <div className="search-meta"><span>{result.originalLanguage?.toUpperCase() || '—'}</span><span>{seriesStatusLabel(result.status)}</span></div>
+                    <small>最新第 {result.latestChapter || '—'} 話</small>
+                    <button className={`button search-add-button ${exists ? '' : 'primary'}`} disabled={exists || importing === result.hid} onClick={() => void importSeries(result)}>
                     {importing === result.hid ? <LoaderCircle className="spin" /> : exists ? <Check /> : <Plus />}{exists ? '已在書庫' : '加入書庫'}
-                  </button>
+                    </button>
+                  </div>
                 </article>
               )
             })}
           </div>
+          {visibleSearchResults.length === 0 && <div className="search-empty filter-empty"><Search /><strong>呢組篩選未有結果</strong><span>試吓揀「全部」。</span></div>}
           {searchHasNext && <div className="search-more-row"><button className="button" disabled={searching} onClick={() => void loadMoreSearch()}>{searching ? <LoaderCircle className="spin" /> : <Plus />}載入更多</button></div>}
           </>}
         </section>
@@ -284,7 +311,7 @@ function App() {
             <div className="library-list">
               {library.map((item) => (
                 <button key={item.hid} className={item.hid === selectedHid ? 'active' : ''} onClick={() => { setSelectedChapters(new Set()); setSelectedHid(item.hid) }}>
-                  <div className="mini-cover">{item.poster_url ? <img src={sourceImage(item.poster_url)} alt="" loading="lazy" /> : <BookOpen />}</div>
+                  <div className="mini-cover">{item.poster_url ? <img src={sourceImage(item.poster_url)} alt={`${item.title}封面`} loading="lazy" /> : <BookOpen aria-hidden="true" />}</div>
                   <div><strong>{item.title}</strong><span>{item.translated_count} / {item.chapter_count} 話已譯</span><i><b style={{ width: `${item.chapter_count ? item.translated_count / item.chapter_count * 100 : 0}%` }} /></i></div>
                   <ChevronRight />
                 </button>

@@ -12,6 +12,10 @@ function integer(name: string, fallback: number): number {
   return Number.isFinite(value) ? value : fallback
 }
 
+function boundedInteger(name: string, fallback: number, minimum: number, maximum: number): number {
+  return Math.min(maximum, Math.max(minimum, integer(name, fallback)))
+}
+
 const reasoningEfforts = ['low', 'medium', 'high', 'xhigh', 'max'] as const
 export type ReasoningEffort = typeof reasoningEfforts[number]
 
@@ -47,6 +51,7 @@ export const config = {
   effortBalanced: reasoningEffort('TRANSLATION_EFFORT_BALANCED', 'high'),
   effortQuality: reasoningEffort('TRANSLATION_EFFORT_QUALITY', 'max'),
   effortAudit: reasoningEffort('TRANSLATION_EFFORT_AUDIT', 'low'),
+  translationChapterConcurrency: boundedInteger('TRANSLATION_CHAPTER_CONCURRENCY', 2, 1, 4),
   maxImageEdge: integer('MAX_IMAGE_EDGE', 2048),
   translationBackend: process.env.TRANSLATION_BACKEND ?? 'openai',
   codexCliPath: process.env.CODEX_CLI_PATH ?? 'codex',
