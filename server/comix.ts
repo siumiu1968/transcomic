@@ -102,7 +102,15 @@ export class ComixClient {
           last = response.meta?.lastPage ?? current
           current += 1
         } while (current <= last)
-        return chapters
+        const preferred = new Map<string, SourceChapter>()
+        for (const chapter of chapters) {
+          const key = String(chapter.number)
+          const current = preferred.get(key)
+          if (!current || (chapter.isOfficial && !current.isOfficial) || (chapter.isOfficial === current.isOfficial && chapter.id > current.id)) {
+            preferred.set(key, chapter)
+          }
+        }
+        return [...preferred.values()].sort((left, right) => right.number - left.number || right.id - left.id)
       }, { href, hid }) as Promise<SourceChapter[]>
     })
   }

@@ -21,6 +21,7 @@ export interface SourceChapter {
   volume: number
   name: string
   language: string
+  isOfficial?: boolean
   createdAtFormatted?: string
   url: string
 }

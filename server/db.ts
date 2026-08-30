@@ -95,6 +95,15 @@ export class Store {
       for (const chapter of chapters) {
         statement.run(chapter.id, seriesHid, chapter.number ?? 0, chapter.volume ?? 0, chapter.name ?? '', chapter.language ?? '', chapter.url)
       }
+      if (chapters.length > 0) {
+        const placeholders = chapters.map(() => '?').join(',')
+        this.db.prepare(`
+          DELETE FROM chapters
+          WHERE series_hid=? AND id NOT IN (${placeholders})
+            AND id NOT IN (SELECT chapter_id FROM pages)
+            AND id NOT IN (SELECT chapter_id FROM jobs)
+        `).run(seriesHid, ...chapters.map((chapter) => chapter.id))
+      }
       this.db.exec('COMMIT')
     } catch (error) {
       this.db.exec('ROLLBACK')

@@ -43,6 +43,8 @@ test('store imports a series and chapters without duplicating them', () => {
     store.upsertChapters('demo', chapters)
     assert.equal(store.listSeries()[0]?.chapter_count, 2)
     assert.deepEqual(store.listChapters('demo').map((chapter) => chapter.id), [102, 101])
+    store.upsertChapters('demo', [chapters[1]])
+    assert.deepEqual(store.listChapters('demo').map((chapter) => chapter.id), [102])
     store.db.close()
   } finally {
     fs.rmSync(folder, { recursive: true, force: true })
