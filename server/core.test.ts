@@ -8,7 +8,7 @@ import { isAllowedSourceUrl } from './comix.js'
 import { config } from './config.js'
 import { hasTranslationOutput, Store } from './db.js'
 import { completionStatus, TranslationQueue } from './queue.js'
-import { balanceTranslationLines, matchEdgeClippedOcrLines, matchOcrLines, normalizeDisplayText, planNarrationCaption, renderTranslation, renderTranslationDetailed } from './renderer.js'
+import { balanceTranslationLines, detectVisualTextLines, filterUsableOcrLines, matchEdgeClippedOcrLines, matchOcrLines, modelBackedVisualLinesAreTight, normalizeDisplayText, planNarrationCaption, renderTranslation, renderTranslationDetailed } from './renderer.js'
 import { codexTimeoutForEffort, mergeTranslationResults, parseTranslationOutput, withAuditFallback } from './translator.js'
 
 test('source image allowlist blocks SSRF targets', () => {
@@ -82,6 +82,35 @@ test('renderer skips an unverified fallback instead of covering artwork', async 
   assert.ok(unverifiedInk[0] < 50)
 })
 
+test('visual fallback accepts tall colored lettering only when model geometry backs it', async () => {
+  const source = Buffer.from('<svg width="600" height="900" xmlns="http://www.w3.org/2000/svg"><rect width="600" height="900" fill="#fff"/><rect x="240" y="365" width="20" height="38" fill="#985f38"/><rect x="270" y="365" width="24" height="38" fill="#985f38"/><rect x="330" y="388" width="8" height="8" fill="#985f38"/><rect x="343" y="388" width="8" height="8" fill="#985f38"/></svg>')
+  const region = {
+    x: 150,
+    y: 270,
+    width: 300,
+    height: 270,
+    safe: { x: 228, y: 351, width: 150, height: 81 },
+    lines: [{ x: 234, y: 360, width: 132, height: 54 }],
+    source: 'SO',
+    text: '所以……',
+    kind: 'speech' as const,
+  }
+  const visual = await detectVisualTextLines(source, region)
+  assert.equal(visual.length, 1)
+  assert.ok(visual[0].height >= 38)
+})
+
+test('model-backed visual full erase rejects a large CV box with one-way overlap only', () => {
+  assert.equal(modelBackedVisualLinesAreTight(
+    [{ x: 306, y: 753, width: 89, height: 51 }],
+    [{ x: 314, y: 761, width: 74, height: 41 }],
+  ), true)
+  assert.equal(modelBackedVisualLinesAreTight(
+    [{ x: 50, y: 80, width: 300, height: 80 }],
+    [{ x: 100, y: 100, width: 100, height: 40 }],
+  ), false)
+})
+
 test('OCR line matching returns only confident words from the model source', () => {
   const lines = matchOcrLines([
     { x: 130, y: 140, width: 52, height: 20, confidence: 96, line: '1:1:1:1', text: 'Hello' },
@@ -114,7 +143,7 @@ test('OCR line matching joins split words and ignores duplicate noise', () => {
 
 test('OCR line matching keeps a high-confidence stutter initial beside matched dialogue', () => {
   const lines = matchOcrLines([
-    { x: 100, y: 140, width: 18, height: 20, confidence: 94, line: '1:1:1:1', text: 'B,' },
+    { x: 100, y: 140, width: 18, height: 20, confidence: 94, line: '1:9:1:1', text: 'B,' },
     { x: 126, y: 140, width: 40, height: 20, confidence: 96, line: '1:1:1:1', text: 'BUT' },
     { x: 174, y: 140, width: 30, height: 20, confidence: 95, line: '1:1:1:1', text: 'HE' },
   ], {
@@ -125,6 +154,18 @@ test('OCR line matching keeps a high-confidence stutter initial beside matched d
     source: 'B, BUT HE',
   })
   assert.deepEqual(lines, [{ x: 100, y: 140, width: 104, height: 20 }])
+})
+
+test('model line height admits a verified outlined OCR row in a short safe box', () => {
+  const outlined = { x: 799, y: 564, width: 143, height: 38 }
+  assert.deepEqual(filterUsableOcrLines([outlined], {
+    safe: { x: 797, y: 576, width: 148, height: 42 },
+    lines: [{ x: 800, y: 579, width: 143, height: 37 }],
+  }), [outlined])
+  assert.deepEqual(filterUsableOcrLines([outlined], {
+    safe: { x: 797, y: 576, width: 148, height: 42 },
+    lines: [],
+  }), [])
 })
 
 test('narration caption fallback requires complete OCR aligned to every model row', () => {
@@ -259,6 +300,33 @@ test('model-backed narration tolerates one cropped single-letter source word', (
   ]
   assert.ok(planNarrationCaption(ocr, narration, 600, 900))
   assert.equal(planNarrationCaption(ocr, { ...narration, lines: [], safe: { ...narration.safe, height: 120 } }, 600, 900), null)
+})
+
+test('model-backed narration limits a stylized OCR miss to one short source word', () => {
+  const narration = {
+    x: 80,
+    y: 100,
+    width: 360,
+    height: 120,
+    safe: { x: 90, y: 105, width: 340, height: 105 },
+    lines: [
+      { x: 100, y: 112, width: 300, height: 24 },
+      { x: 110, y: 155, width: 280, height: 24 },
+    ],
+    source: 'WE BRAVELY MUSTERED UP THE COURAGE',
+    text: '我哋鼓起咗勇氣。',
+    kind: 'narration' as const,
+  }
+  const ocr = [
+    { x: 105, y: 114, width: 35, height: 20, confidence: 96, line: '1:1:1:1', text: 'WE' },
+    { x: 148, y: 114, width: 70, height: 20, confidence: 96, line: '1:1:1:1', text: 'BRAVELY' },
+    { x: 226, y: 114, width: 110, height: 20, confidence: 95, line: '1:1:1:1', text: 'MUSTERED' },
+    { x: 344, y: 114, width: 32, height: 20, confidence: 82, line: '1:1:1:1', text: 'UF' },
+    { x: 115, y: 157, width: 52, height: 20, confidence: 96, line: '1:1:1:2', text: 'THE' },
+    { x: 175, y: 157, width: 135, height: 20, confidence: 94, line: '1:1:1:2', text: 'COURAGE' },
+  ]
+  assert.ok(planNarrationCaption(ocr, narration, 600, 900))
+  assert.equal(planNarrationCaption(ocr, { ...narration, source: 'WE BRAVELY MUSTERED UP TO THE COURAGE' }, 600, 900), null)
 })
 
 test('renderer accepts one clipped top row only when three clear OCR rows align', () => {

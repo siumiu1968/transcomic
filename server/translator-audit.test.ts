@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  buildCompletenessPrompt,
   findUncoveredDialogueHints,
   mergeCompletenessResults,
   mergeTranslationResults,
@@ -142,6 +143,35 @@ test('OCR completeness gate joins nearby short rows but ignores isolated SFX and
   assert.deepEqual(findUncoveredDialogueHints(hints, { regions: [] }).map(({ text }) => text), ['OLD', 'MAN'])
 })
 
+test('OCR completeness gate keeps only continuation story text on the actual end-credit page', () => {
+  const hints = [
+    { text: 'To Be Continued', box: { x: 320, y: 80, width: 360, height: 55 }, confidence: 97 },
+    { text: 'Partners', box: { x: 420, y: 300, width: 160, height: 24 }, confidence: 96 },
+    { text: 'All rights reserved', box: { x: 350, y: 345, width: 300, height: 20 }, confidence: 95 },
+    { text: 'Published under license', box: { x: 330, y: 380, width: 340, height: 20 }, confidence: 94 },
+    { text: 'All rights reserved. Published under license from partners', box: { x: 180, y: 397, width: 640, height: 20 }, confidence: 96 },
+    { text: 'Translation and localization produced by', box: { x: 260, y: 415, width: 480, height: 20 }, confidence: 96 },
+    { text: 'Produced by MOON STUDIO', box: { x: 340, y: 450, width: 320, height: 22 }, confidence: 93 },
+    { text: 'tappytoon', box: { x: 420, y: 470, width: 160, height: 22 }, confidence: 96 },
+    { text: 'STUDIO', box: { x: 450, y: 485, width: 100, height: 26 }, confidence: 92 },
+    { text: 'LOGO', box: { x: 460, y: 520, width: 80, height: 24 }, confidence: 91 },
+  ]
+
+  assert.deepEqual(findUncoveredDialogueHints(hints, { regions: [] }).map(({ text }) => text), ['To Be Continued'])
+})
+
+test('OCR completeness gate retains generic labels when there is no strong credit context', () => {
+  const hints = [
+    { text: 'Partners', box: { x: 100, y: 80, width: 140, height: 28 }, confidence: 96 },
+    { text: 'Studio', box: { x: 700, y: 280, width: 120, height: 28 }, confidence: 95 },
+    { text: 'Logo', box: { x: 120, y: 480, width: 90, height: 28 }, confidence: 94 },
+    { text: 'Our partners betrayed us.', box: { x: 100, y: 690, width: 310, height: 30 }, confidence: 96 },
+    { text: 'The studio is on fire!', box: { x: 540, y: 760, width: 330, height: 30 }, confidence: 97 },
+  ]
+
+  assert.deepEqual(findUncoveredDialogueHints(hints, { regions: [] }).map(({ text }) => text), hints.map(({ text }) => text))
+})
+
 test('completeness repair is append-only for a repeated source region', () => {
   const current = parseTranslationOutput(JSON.stringify({ regions: [{
     id: 1,
@@ -161,6 +191,42 @@ test('completeness repair is append-only for a repeated source region', () => {
 
   const merged = mergeCompletenessResults(current, repair, [candidate])
   assert.deepEqual(merged, current)
+})
+
+test('bounded completeness repair can add multi-line frameless story narration', async () => {
+  const hints = [
+    { text: 'I DECIDED TO CLING', box: { x: 266, y: 58, width: 462, height: 18 }, confidence: 91 },
+    { text: 'TO MY LIFE AGAIN.', box: { x: 301, y: 80, width: 392, height: 19 }, confidence: 95 },
+    { text: "I DON'T WANT TO", box: { x: 210, y: 464, width: 310, height: 15 }, confidence: 96 },
+    { text: 'DIE WITH YOU.', box: { x: 244, y: 487, width: 242, height: 15 }, confidence: 96 },
+  ]
+  const current = parseTranslationOutput(JSON.stringify({ regions: [{
+    id: 1,
+    bubble: { x: 165, y: 365, width: 360, height: 250 },
+    safe: { x: 206, y: 462, width: 260, height: 42 },
+    lines: [{ x: 210, y: 464, width: 250, height: 15 }, { x: 244, y: 487, width: 220, height: 15 }],
+    source: "I DON'T WANT TO DIE WITH YOU.", translation: '我唔想同你一齊死。', kind: 'speech',
+  }] }))
+  const narration = parseTranslationOutput(JSON.stringify({ regions: [{
+    id: 2,
+    bubble: { x: 258, y: 50, width: 478, height: 58 },
+    safe: { x: 264, y: 56, width: 466, height: 48 },
+    lines: [{ x: 266, y: 58, width: 462, height: 18 }, { x: 301, y: 80, width: 392, height: 19 }],
+    source: 'I DECIDED TO CLING TO MY LIFE AGAIN.', translation: '我決定再次珍惜自己嘅生命。', kind: 'narration',
+  }] }))
+
+  const candidates = findUncoveredDialogueHints(hints, current)
+  assert.deepEqual(candidates, hints.slice(0, 2))
+  const prompt = buildCompletenessPrompt(current, candidates)
+  assert.match(prompt, /旁白可以冇可見旁白框/u)
+  assert.match(prompt, /kind=narration/u)
+  assert.match(prompt, /唔適用於孤立／重複聲效、作品／章節名、署名、網站或版權字樣/u)
+
+  const repaired = await withCompletenessRepair(current, hints, async () => narration)
+  assert.deepEqual(repaired.regions.map(({ kind, source }) => ({ kind, source })), [
+    { kind: 'narration', source: 'I DECIDED TO CLING TO MY LIFE AGAIN.' },
+    { kind: 'speech', source: "I DON'T WANT TO DIE WITH YOU." },
+  ])
 })
 
 test('completeness pipeline fails closed when the bounded third pass returns no regions', async () => {

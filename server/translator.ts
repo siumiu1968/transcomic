@@ -249,8 +249,28 @@ function buildAuditPrompt(primary: TranslationResult, context?: TranslationConte
 }
 
 const excludedOcrText = /(?:https?:\/\/|www\.|\.(?:com|net|org|io)\b|discord|patreon|scan(?:lation|s)?\b|cleaner\b|redrawer\b|typesetter\b|translator\b|\b(?:chapter|episode|volume|vol\.?|page)\s*\d*\b)/iu
+const creditOrLegalOcrText = [
+  /^\s*all\s+rights?\s+reserved[.!]?\s+(?:published|distributed)\s+under\s+(?:an?\s+)?licen[cs]e(?:\s+(?:by|from)\s+[\p{L}\p{N}&.'’ -]+)?[\s©®™.,:;!-]*$/iu,
+  /^\s*tappytoon\s*[©®™.]?\s*$/iu,
+  /^\s*all\s+rights?\s+reserved\b[\s©®™.,:;!-]*$/iu,
+  /^\s*(?:published|distributed)\s+under\s+(?:an?\s+)?licen[cs]e(?:\s+(?:by|from)\s+[\p{L}\p{N}&.'’ -]+)?[\s©®™.,:;!-]*$/iu,
+  /^\s*(?:translation\s+and\s+locali[sz]ation(?:\s+(?:(?:produced|provided)\s+by)(?:\s+[\p{L}\p{N}&.'’ -]+)?)?|translation\s+and|(?:and\s+)?locali[sz]ation(?:\s+(?:produced|provided)(?:\s+by(?:\s+[\p{L}\p{N}&.'’ -]+)?)?)?|(?:translation|locali[sz]ation)\s+(?:produced|provided|handled)\s+by(?:\s+[\p{L}\p{N}&.'’ -]+)?)\s*[:：-]?\s*$/iu,
+  /^\s*(?:produced|presented|published|licensed)\s+by(?:\s+[\p{L}\p{N}&.'’ -]+)?\s*[:：-]?\s*$/iu,
+  /^\s*(?:copyright\b|©)(?:\s+[\p{L}\p{N}&.'’(), -]+)?[\s©®™.,:;!-]*$/iu,
+]
+const genericCreditLabelOcrText = /^\s*(?:partners?|studio|logo)\s*[:：-]?\s*$/iu
 const dialogueSingletons = new Set(['yes', 'no', 'wait', 'stop', 'help', 'why', 'what', 'who', 'where', 'when', 'how', 'hey', 'hello', 'sorry', 'thanks'])
 const commonSfxWords = new Set(['bam', 'bang', 'boom', 'buzz', 'click', 'cough', 'crash', 'creak', 'drip', 'drop', 'gasp', 'gulp', 'huff', 'knock', 'pant', 'ring', 'rustle', 'sigh', 'slam', 'snort', 'sob', 'splash', 'step', 'swoosh', 'tap', 'thud', 'whoosh'])
+
+function isCreditOrLegalOcrText(value: string): boolean {
+  return creditOrLegalOcrText.some((pattern) => pattern.test(value))
+}
+
+function isExcludedOcrText(value: string, hasCreditContext = false): boolean {
+  return excludedOcrText.test(value)
+    || isCreditOrLegalOcrText(value)
+    || hasCreditContext && genericCreditLabelOcrText.test(value)
+}
 
 function latinWords(value: string): string[] {
   return value.match(/[a-z]+(?:['’][a-z]+)*/giu) ?? []
@@ -291,8 +311,9 @@ function hintsAreNeighbours(left: OcrHint, right: OcrHint): boolean {
     && horizontalGap <= Math.max(32, typicalWidth * 0.65)
 }
 
-function looksLikeDialogueText(value: string): boolean {
-  if (excludedOcrText.test(value) || looksLikeSfxText(value)) return false
+function looksLikeDialogueText(value: string, hasCreditContext = false): boolean {
+  if (isExcludedOcrText(value, hasCreditContext) || looksLikeSfxText(value)) return false
+  if (genericCreditLabelOcrText.test(value)) return true
   const words = latinWords(value)
   const letters = words.reduce((total, word) => total + word.replace(/['’]/gu, '').length, 0)
   const word = words[0]?.toLocaleLowerCase() ?? ''
@@ -309,18 +330,22 @@ function looksLikeDialogueText(value: string): boolean {
  */
 export function findUncoveredDialogueHints(hints: OcrHint[], result: TranslationResult): OcrHint[] {
   const regions = normalize(result).regions
+  const strongCreditHints = new Set(hints
+    .filter((hint) => (hint.confidence ?? 100) >= 60 && isCreditOrLegalOcrText(hint.text))
+    .map((hint) => hint.text.trim().toLocaleLowerCase()))
+  const hasCreditContext = strongCreditHints.size >= 2
   const uncovered = hints.filter((hint) => {
     // Low-confidence manga artwork produces a lot of word-shaped noise. Clear
     // missed dialogue in the failure cases is consistently above this bar.
     if ((hint.confidence ?? 100) < 60) return false
-    if (!/[a-z]/iu.test(hint.text) || excludedOcrText.test(hint.text) || looksLikeSfxText(hint.text)) return false
+    if (!/[a-z]/iu.test(hint.text) || isExcludedOcrText(hint.text, hasCreditContext) || looksLikeSfxText(hint.text)) return false
     return !hintIsCovered(hint, regions)
   })
   return uncovered.filter((hint, index) => {
-    if (looksLikeDialogueText(hint.text)) return true
+    if (looksLikeDialogueText(hint.text, hasCreditContext)) return true
     return uncovered.some((other, otherIndex) => {
       if (index === otherIndex || !hintsAreNeighbours(hint, other)) return false
-      return looksLikeDialogueText(`${hint.text} ${other.text}`)
+      return looksLikeDialogueText(`${hint.text} ${other.text}`, hasCreditContext)
     })
   }).slice(0, 32)
 }
@@ -394,12 +419,13 @@ export async function withCompletenessRepair(
   return repaired
 }
 
-function buildCompletenessPrompt(current: TranslationResult, candidates: OcrHint[], context?: TranslationContext): string {
+export function buildCompletenessPrompt(current: TranslationResult, candidates: OcrHint[], context?: TranslationContext): string {
   const nextId = current.regions.reduce((maximum, region) => Math.max(maximum, region.id), 0) + 1
   return [
     '只分析附加嘅同一張漫畫頁面，不得使用任何工具或讀取其他檔案。',
     '呢次係 OCR 完整度閘門觸發嘅定點查漏。第一張係乾淨原圖；第二張校對圖入面，藍框／紅框係已翻譯區域，黃色 OCR 框係仍未被任何已翻譯 safe 範圍覆蓋嘅英文。逐個黃色框查看原圖上下文；多個相鄰黃色框可能屬於同一個對話泡。',
     '逐個黃色框作決定；只要確實係角色對白或推進故事旁白，就必須回傳佢所屬嘅完整 bubble。頁頂／頁底被裁切、承接上一頁或下一頁、甚至畫面只見半句，都要翻譯當頁清楚可讀嘅部分，唔可以等下一頁或因句子不完整而略過。相鄰黃色框屬同一個泡時要合併成一個 region，source 必須包含畫面可見候選文字。',
+    '推進故事嘅旁白可以冇可見旁白框：相鄰黃色框合成連貫敘事句子時，即使文字直接印喺畫面、位於頁頂、字體較大或有顏色，都唔可以單憑冇框或視覺樣式當成標題／裝飾字。呢類無框旁白用 kind=narration；bubble 只需緊貼整組可見文字範圍，唔好虛構一個不存在嘅外框。呢個規則唔適用於孤立／重複聲效、作品／章節名、署名、網站或版權字樣。',
     '嚴禁回傳擬聲詞、動作音效、招式裝飾字、章節／作品標題、頁碼、網站／掃圖組字樣、水印、署名或來源資訊；黃色框只係可能有漏項嘅 OCR 提示，唔代表一定要翻譯。已存在嘅藍／紅框內容亦唔好重複。',
     `新 region id 由 ${nextId} 開始連續遞增。按日漫閱讀次序由右至左、由上至下。翻譯成自然繁體中文（香港用語）。每個 region 提供精準 bubble、safe、lines（0 至 1000 座標）；lines 緊貼每行原文字，safe 係 lines 緊密聯集並完全位於 bubble。只輸出符合 schema 嘅 JSON。`,
     `UNCOVERED OCR CANDIDATES:\n${JSON.stringify(candidates)}`,

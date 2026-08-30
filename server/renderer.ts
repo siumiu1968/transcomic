@@ -288,7 +288,7 @@ function chooseVisualRows(rows: InkRow[], region: PixelRegion): InkRow[] {
   return best
 }
 
-async function detectVisualTextLines(image: Buffer, region: PixelRegion): Promise<PixelBox[]> {
+export async function detectVisualTextLines(image: Buffer, region: PixelRegion): Promise<PixelBox[]> {
   const marginX = Math.max(3, Math.round(region.safe.width * 0.14))
   const marginY = Math.max(6, Math.round(region.safe.height * 0.38))
   const left = Math.max(region.x, region.safe.x - marginX)
@@ -306,7 +306,8 @@ async function detectVisualTextLines(image: Buffer, region: PixelRegion): Promis
     .raw()
     .toBuffer()
   const maximumWidth = Math.max(10, Math.round((region.safe.width + marginX * 2) * 0.96))
-  const maximumHeight = Math.max(8, Math.round(region.safe.height * 0.45))
+  const modelLineHeight = median(region.lines.map((line) => line.height))
+  const maximumHeight = Math.max(8, Math.round(region.safe.height * 0.45), Math.round(modelLineHeight * 1.35))
   const components = findInkComponents(gray, width, height).filter((component) => {
     const componentRight = component.x + component.width
     const componentBottom = component.y + component.height
@@ -389,6 +390,8 @@ interface OcrMatch {
   allLines?: OcrLine[]
   coverage: number
   complete: boolean
+  unmatchedCharacters?: number
+  incompleteSourceWords?: number
 }
 
 type OcrRegion = Pick<PixelRegion, 'x' | 'y' | 'width' | 'height' | 'safe' | 'lines' | 'source'>
@@ -400,9 +403,10 @@ interface NarrationCaptionPlan {
   lines: PixelBox[]
 }
 
-function filterUsableOcrLines<T extends PixelBox>(lines: T[], region: Pick<PixelRegion, 'safe'>): T[] {
+export function filterUsableOcrLines<T extends PixelBox>(lines: T[], region: Pick<PixelRegion, 'safe'> & Partial<Pick<PixelRegion, 'lines'>>): T[] {
   const minimumHeight = Math.max(4, Math.min(12, Math.round(region.safe.height * 0.08)))
-  const maximumHeight = Math.max(minimumHeight, Math.round(region.safe.height * 0.65))
+  const modelLineHeight = median((region.lines ?? []).map((line) => line.height))
+  const maximumHeight = Math.max(minimumHeight, Math.round(region.safe.height * 0.65), Math.round(modelLineHeight * 1.35))
   const maximumWidth = Math.max(8, Math.round(region.safe.width * 1.45))
   const marginX = region.safe.width * 0.35
   const marginY = region.safe.height * 0.35
@@ -480,17 +484,28 @@ function matchOcrLinesWithCoverage(words: OcrWord[], region: Pick<PixelRegion, '
     matchedWords.push(word)
   }
   const totalCharacters = sourceWords.reduce((total, word) => total + word.length, 0)
-  const matchedCoverage = coveredCharacters.reduce((total, characters) => total + characters.size, 0) / Math.max(1, totalCharacters)
+  const matchedCharacters = coveredCharacters.reduce((total, characters) => total + characters.size, 0)
+  const matchedCoverage = matchedCharacters / Math.max(1, totalCharacters)
   const complete = coveredCharacters.every((characters, index) => characters.size / sourceWords[index].length >= 0.85)
-  if (matchedCoverage < 0.38) return { lines: [], coverage: matchedCoverage, complete }
+  const unmatchedCharacters = totalCharacters - matchedCharacters
+  const incompleteSourceWords = coveredCharacters.filter((characters, index) => characters.size / sourceWords[index].length < 0.85).length
+  if (matchedCoverage < 0.38) return { lines: [], coverage: matchedCoverage, complete, unmatchedCharacters, incompleteSourceWords }
   // If one word on a Tesseract line matches the model source, include its
   // low-confidence siblings in the same tight line box. Stylized short words
   // such as "IS" are often unreadable to OCR but still need to be erased.
   const matchedLineIds = new Set(matchedWords.map((word) => word.line).filter(Boolean))
-  const isNearbyLineSibling = (word: OcrWord): boolean => matchedLineIds.has(word.line) && matchedWords.some((matched) => {
-    if (matched.line !== word.line) return false
+  const sourceInitials = new Set(region.source.split(/\s+/u).map(normalizedWord).filter((word) => word.length === 1))
+  const isNearbyLineSibling = (word: OcrWord): boolean => matchedWords.some((matched) => {
     const horizontalGap = Math.max(0, Math.max(matched.x, word.x) - Math.min(matched.x + matched.width, word.x + word.width))
-    return horizontalGap <= Math.max(5, Math.max(matched.height, word.height) * 1.5)
+    if (matchedLineIds.has(word.line) && matched.line === word.line) return horizontalGap <= Math.max(5, Math.max(matched.height, word.height) * 1.5)
+    const normalized = normalizedWord(word.text)
+    const verticalDelta = Math.abs(word.y + word.height / 2 - matched.y - matched.height / 2)
+    return normalized.length === 1
+      && sourceInitials.has(normalized)
+      && word.confidence >= 70
+      && word.x <= matched.x
+      && horizontalGap <= Math.max(5, Math.max(matched.height, word.height) * 1.5)
+      && verticalDelta <= Math.max(matched.height, word.height) * 0.62
   })
   const lineWords = [
     ...matchedWords,
@@ -531,20 +546,47 @@ function matchOcrLinesWithCoverage(words: OcrWord[], region: Pick<PixelRegion, '
     const area = (value: OcrLine[]) => value.reduce((total, line) => total + line.width * line.height, 0)
     return area(right) - area(left)
   })[0] ?? []
-  return { lines: contiguousLines, allLines: lines, coverage: matchedCoverage, complete }
+  return { lines: contiguousLines, allLines: lines, coverage: matchedCoverage, complete, unmatchedCharacters, incompleteSourceWords }
 }
 
 export function matchOcrLines(words: OcrWord[], region: Pick<PixelRegion, 'x' | 'y' | 'width' | 'height' | 'source'>): PixelBox[] {
   return matchOcrLinesWithCoverage(words, region).lines.map(({ x, y, width, height }) => ({ x, y, width, height }))
 }
 
+export function modelBackedVisualLinesAreTight(lines: PixelBox[], modelLines: PixelBox[]): boolean {
+  if (lines.length === 0 || lines.length !== modelLines.length) return false
+  const visual = [...lines].sort((left, right) => left.y - right.y || left.x - right.x)
+  const model = [...modelLines].sort((left, right) => left.y - right.y || left.x - right.x)
+  return model.every((expected, index) => {
+    const actual = visual[index]
+    const overlapLeft = Math.max(actual.x, expected.x)
+    const overlapTop = Math.max(actual.y, expected.y)
+    const overlapRight = Math.min(actual.x + actual.width, expected.x + expected.width)
+    const overlapBottom = Math.min(actual.y + actual.height, expected.y + expected.height)
+    const intersection = Math.max(0, overlapRight - overlapLeft) * Math.max(0, overlapBottom - overlapTop)
+    const modelOverlap = intersection / Math.max(1, expected.width * expected.height)
+    const visualOverlap = intersection / Math.max(1, actual.width * actual.height)
+    const widthRatio = actual.width / Math.max(1, expected.width)
+    const heightRatio = actual.height / Math.max(1, expected.height)
+    const centreDeltaX = Math.abs(actual.x + actual.width / 2 - expected.x - expected.width / 2)
+    const centreDeltaY = Math.abs(actual.y + actual.height / 2 - expected.y - expected.height / 2)
+    return modelOverlap >= 0.5 && visualOverlap >= 0.5
+      && widthRatio >= 0.65 && widthRatio <= 1.45
+      && heightRatio >= 0.65 && heightRatio <= 1.45
+      && centreDeltaX <= Math.max(actual.width, expected.width) * 0.3
+      && centreDeltaY <= Math.max(actual.height, expected.height) * 0.3
+  })
+}
+
 function narrationCaptionPlanFromMatch(match: OcrMatch, region: PixelRegion, imageWidth: number, imageHeight: number): NarrationCaptionPlan | null {
   const sourceLines = match.allLines ?? match.lines
   if (region.kind !== 'narration' || match.coverage < minimumOcrCoverage || sourceLines.length === 0) return null
-  // A cropped one-character pronoun can be unreadable while every substantial
-  // source word is still matched. Only model-backed narration may use this
-  // narrow allowance; rows without model geometry remain fully fail-closed.
-  if (!match.complete && (region.lines.length === 0 || match.coverage < 0.96)) return null
+  // Stylized narration can lose one very short OCR word (for example NO→NC or
+  // UP→UF) while every model row still aligns. Keep the allowance bounded by
+  // both source characters and words; rows without model geometry stay strict.
+  if (!match.complete && (region.lines.length === 0
+    || match.unmatchedCharacters === undefined || match.unmatchedCharacters > 2
+    || match.incompleteSourceWords === undefined || match.incompleteSourceWords > 1)) return null
   if (sourceLines.some((line) => line.confidence < 25) || median(sourceLines.map((line) => line.confidence)) < 55) return null
 
   const aligned = (ocr: PixelBox, model: PixelBox): boolean => {
@@ -744,9 +786,10 @@ async function createLineCleanupLayer(image: Buffer, region: PixelRegion, imageW
     const areaOf = (candidate: OcrMatch): number => candidate.lines.reduce((total, line) => total + line.width * line.height, 0)
     const coverageDelta = usableRegionalMatch.coverage - match.coverage
     const closeCoverage = Math.abs(coverageDelta) <= 0.03
+    const sourceMoreComplete = (rawRegionalMatch.unmatchedCharacters ?? Number.POSITIVE_INFINITY) < (rawMatch.unmatchedCharacters ?? Number.POSITIVE_INFINITY)
     const tighterOrMoreComplete = usableRegionalMatch.lines.length > match.lines.length
       || areaOf(usableRegionalMatch) < areaOf(match)
-    if (usableRegionalMatch.lines.length > 0 && (usableRegionalMatch.complete && !match.complete || coverageDelta > 0.03 || (closeCoverage && tighterOrMoreComplete) || match.lines.length === 0)) {
+    if (usableRegionalMatch.lines.length > 0 && (usableRegionalMatch.complete && !match.complete || coverageDelta > 0.03 || (sourceMoreComplete && coverageDelta >= 0) || (closeCoverage && tighterOrMoreComplete) || match.lines.length === 0)) {
       rawMatch = rawRegionalMatch
       match = usableRegionalMatch
     }
@@ -916,10 +959,11 @@ async function createLineCleanupLayer(image: Buffer, region: PixelRegion, imageW
       && centreY >= region.safe.y - region.safe.height * 0.2
       && centreY <= region.safe.y + region.safe.height * 1.2
   })
-  if (tightMonochromeOcr) {
-    // On the light B/W bubbles used by most manga, a tight OCR line box is a
-    // more reliable eraser than trying to reconstruct every anti-aliased
-    // glyph pixel. CV guesses still use the ink-only branch below.
+  const tightModelBackedVisual = !ocrLines && monochromeBubble && region.kind === 'speech'
+    && modelBackedVisualLinesAreTight(lines, region.lines)
+  if (tightMonochromeOcr || tightModelBackedVisual) {
+    // On light B/W bubbles, a tightly verified OCR box or a CV row backed by
+    // every model line is safer than reconstructing anti-aliased glyph pixels.
     for (const box of boxes) {
       for (let y = box.top - top; y < box.bottom - top; y += 1) {
         alpha.fill(255, y * width + box.left - left, y * width + box.right - left)
