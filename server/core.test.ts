@@ -8,7 +8,7 @@ import { isAllowedSourceUrl } from './comix.js'
 import { config } from './config.js'
 import { hasTranslationOutput, Store } from './db.js'
 import { completionStatus, TranslationQueue } from './queue.js'
-import { balanceTranslationLines, matchOcrLines, normalizeDisplayText, renderTranslation, renderTranslationDetailed } from './renderer.js'
+import { balanceTranslationLines, matchEdgeClippedOcrLines, matchOcrLines, normalizeDisplayText, renderTranslation, renderTranslationDetailed } from './renderer.js'
 import { codexTimeoutForEffort, mergeTranslationResults, parseTranslationOutput, withAuditFallback } from './translator.js'
 
 test('source image allowlist blocks SSRF targets', () => {
@@ -110,6 +110,61 @@ test('OCR line matching joins split words and ignores duplicate noise', () => {
     source: 'PREPARED',
   })
   assert.deepEqual(lines, [{ x: 120, y: 140, width: 106, height: 20 }])
+})
+
+test('renderer accepts one clipped top row only when three clear OCR rows align', () => {
+  const region = {
+    x: 100,
+    y: 0,
+    width: 400,
+    height: 240,
+    safe: { x: 140, y: 0, width: 320, height: 150 },
+    lines: [
+      { x: 240, y: 0, width: 120, height: 20 },
+      { x: 220, y: 40, width: 160, height: 25 },
+      { x: 230, y: 72, width: 140, height: 25 },
+      { x: 200, y: 104, width: 200, height: 25 },
+    ],
+    source: 'TOP THE REST IS CLEAR ENOUGH NOW',
+  }
+  const clearRows = [
+    { x: 242, y: 0, width: 30, height: 12, confidence: 35, line: '1:1:1:1', text: '(OU' },
+    { x: 278, y: 0, width: 38, height: 12, confidence: 29, line: '1:1:1:1', text: 'TMeKR' },
+    { x: 322, y: 0, width: 75, height: 12, confidence: 0, line: '1:1:1:1', text: 'VANGECKROUHNS' },
+    { x: 225, y: 43, width: 55, height: 19, confidence: 96, line: '1:1:1:2', text: 'THE' },
+    { x: 288, y: 43, width: 86, height: 19, confidence: 95, line: '1:1:1:2', text: 'REST' },
+    { x: 235, y: 75, width: 28, height: 19, confidence: 93, line: '1:1:1:3', text: 'IS' },
+    { x: 271, y: 75, width: 94, height: 19, confidence: 97, line: '1:1:1:3', text: 'CLEAR' },
+    { x: 205, y: 107, width: 120, height: 19, confidence: 94, line: '1:1:1:4', text: 'ENOUGH' },
+    { x: 333, y: 107, width: 62, height: 19, confidence: 96, line: '1:1:1:4', text: 'NOW' },
+  ]
+
+  assert.deepEqual(matchEdgeClippedOcrLines(clearRows, region, 600, 900), [
+    region.lines[0],
+    { x: 225, y: 43, width: 149, height: 19 },
+    { x: 235, y: 75, width: 130, height: 19 },
+    { x: 205, y: 107, width: 190, height: 19 },
+  ])
+  const fuzzyEdgeRows = [
+    ...clearRows,
+    { x: 245, y: 0, width: 90, height: 18, confidence: 12, line: '1:1:1:1', text: 'DANGEROUS' },
+  ]
+  assert.deepEqual(matchEdgeClippedOcrLines(fuzzyEdgeRows, {
+    ...region,
+    source: 'TO HER DANGEROUS THE REST IS CLEAR ENOUGH NOW',
+  }, 600, 900), [
+    region.lines[0],
+    { x: 225, y: 43, width: 149, height: 19 },
+    { x: 235, y: 75, width: 130, height: 19 },
+    { x: 205, y: 107, width: 190, height: 19 },
+  ])
+  assert.deepEqual(matchEdgeClippedOcrLines(clearRows, {
+    ...region,
+    y: 1,
+    safe: { ...region.safe, y: 1 },
+    lines: region.lines.map((line) => ({ ...line, y: line.y + 1 })),
+  }, 600, 900), [])
+  assert.deepEqual(matchEdgeClippedOcrLines(clearRows.map((word) => word.line === '1:1:1:3' ? { ...word, confidence: 59 } : word), region, 600, 900), [])
 })
 
 test('typesetter compacts Chinese punctuation and keeps closing punctuation off new lines', () => {

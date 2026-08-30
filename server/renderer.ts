@@ -379,15 +379,21 @@ function editDistance(left: string, right: string): number {
   return previous[right.length]
 }
 
+interface OcrLine extends PixelBox {
+  confidence: number
+}
+
 interface OcrMatch {
-  lines: PixelBox[]
+  lines: OcrLine[]
   coverage: number
   complete: boolean
 }
 
+type OcrRegion = Pick<PixelRegion, 'x' | 'y' | 'width' | 'height' | 'safe' | 'lines' | 'source'>
+
 const minimumOcrCoverage = 0.92
 
-function filterUsableOcrLines(lines: PixelBox[], region: PixelRegion): PixelBox[] {
+function filterUsableOcrLines<T extends PixelBox>(lines: T[], region: Pick<PixelRegion, 'safe'>): T[] {
   const minimumHeight = Math.max(4, Math.min(12, Math.round(region.safe.height * 0.08)))
   const maximumHeight = Math.max(minimumHeight, Math.round(region.safe.height * 0.65))
   const maximumWidth = Math.max(8, Math.round(region.safe.width * 1.45))
@@ -496,15 +502,16 @@ function matchOcrLinesWithCoverage(words: OcrWord[], region: Pick<PixelRegion, '
     }
     line.push(word)
   }
-  const lines = grouped.map((line) => {
+  const lines = grouped.map((line): OcrLine => {
     const left = Math.min(...line.map((word) => word.x))
     const top = Math.min(...line.map((word) => word.y))
     const right = Math.max(...line.map((word) => word.x + word.width))
     const bottom = Math.max(...line.map((word) => word.y + word.height))
-    return { x: left, y: top, width: right - left, height: bottom - top }
+    const confidence = Math.max(...line.filter((word) => matchedWords.includes(word)).map((word) => word.confidence))
+    return { x: left, y: top, width: right - left, height: bottom - top, confidence }
   }).sort((left, right) => left.y - right.y || left.x - right.x)
   const typicalHeight = Math.max(4, median(lines.map((line) => line.height)))
-  const blocks: PixelBox[][] = []
+  const blocks: OcrLine[][] = []
   for (const line of lines) {
     const block = blocks.at(-1)
     const previous = block?.at(-1)
@@ -513,14 +520,67 @@ function matchOcrLinesWithCoverage(words: OcrWord[], region: Pick<PixelRegion, '
   }
   const contiguousLines = blocks.sort((left, right) => {
     if (right.length !== left.length) return right.length - left.length
-    const area = (value: PixelBox[]) => value.reduce((total, line) => total + line.width * line.height, 0)
+    const area = (value: OcrLine[]) => value.reduce((total, line) => total + line.width * line.height, 0)
     return area(right) - area(left)
   })[0] ?? []
   return { lines: contiguousLines, coverage: matchedCoverage, complete }
 }
 
 export function matchOcrLines(words: OcrWord[], region: Pick<PixelRegion, 'x' | 'y' | 'width' | 'height' | 'source'>): PixelBox[] {
-  return matchOcrLinesWithCoverage(words, region).lines
+  return matchOcrLinesWithCoverage(words, region).lines.map(({ x, y, width, height }) => ({ x, y, width, height }))
+}
+
+function edgeAwareCleanupLines(match: OcrMatch, region: OcrRegion, imageWidth: number, imageHeight: number): PixelBox[] {
+  if (match.coverage >= minimumOcrCoverage || match.coverage < 0.68) return []
+  // Infer only one row that is physically clipped by the page. Every visible
+  // model row still has to agree with a clear OCR row before pixels are changed.
+  const modelLines = [...region.lines].sort((left, right) => left.y - right.y || left.x - right.x)
+  const ocrLines = [...match.lines].sort((left, right) => left.y - right.y || left.x - right.x)
+  const edges = [
+    { regionTouches: region.x === 0 && region.safe.x === 0, lineTouches: (line: PixelBox) => line.x === 0 },
+    { regionTouches: region.y === 0 && region.safe.y === 0, lineTouches: (line: PixelBox) => line.y === 0 },
+    { regionTouches: region.x + region.width === imageWidth && region.safe.x + region.safe.width === imageWidth, lineTouches: (line: PixelBox) => line.x + line.width === imageWidth },
+    { regionTouches: region.y + region.height === imageHeight && region.safe.y + region.safe.height === imageHeight, lineTouches: (line: PixelBox) => line.y + line.height === imageHeight },
+  ]
+  for (const edge of edges) {
+    if (!edge.regionTouches) continue
+    const clippedLines = modelLines.filter(edge.lineTouches)
+    const visibleLines = modelLines.filter((line) => !edge.lineTouches(line))
+    const clippedOcrLines = ocrLines.filter(edge.lineTouches)
+    const visibleOcrLines = ocrLines.filter((line) => !edge.lineTouches(line))
+    // Tesseract can fuzzy-match a few mangled glyphs on the cropped row. Treat
+    // that single low-confidence edge row as clipped rather than as a fourth
+    // visible row; a clear edge row must still pass the normal 0.92 gate.
+    if (clippedLines.length !== 1 || clippedOcrLines.length > 1 || clippedOcrLines.some((line) => line.confidence >= 60)) continue
+    if (visibleLines.length < 3 || visibleOcrLines.length !== visibleLines.length) continue
+    if (visibleOcrLines.some((line) => line.confidence < 60 || edge.lineTouches(line))) continue
+    const typicalModelHeight = median(visibleLines.map((line) => line.height))
+    if (clippedLines[0].height > typicalModelHeight * 1.5 || clippedLines[0].width > region.safe.width) continue
+
+    const aligned = visibleOcrLines.every((line, index) => {
+      const model = visibleLines[index]
+      const overlapLeft = Math.max(line.x, model.x)
+      const overlapTop = Math.max(line.y, model.y)
+      const overlapRight = Math.min(line.x + line.width, model.x + model.width)
+      const overlapBottom = Math.min(line.y + line.height, model.y + model.height)
+      const intersection = Math.max(0, overlapRight - overlapLeft) * Math.max(0, overlapBottom - overlapTop)
+      const overlap = intersection / Math.max(1, Math.min(line.width * line.height, model.width * model.height))
+      const centreDelta = Math.abs(line.y + line.height / 2 - model.y - model.height / 2)
+      const widthRatio = line.width / Math.max(1, model.width)
+      const heightRatio = line.height / Math.max(1, model.height)
+      return overlap >= 0.45
+        && centreDelta <= Math.max(line.height, model.height) * 0.55
+        && widthRatio >= 0.45 && widthRatio <= 1.8
+        && heightRatio >= 0.45 && heightRatio <= 1.8
+    })
+    if (aligned) return [clippedLines[0], ...visibleOcrLines.map(({ x, y, width, height }) => ({ x, y, width, height }))]
+  }
+  return []
+}
+
+export function matchEdgeClippedOcrLines(words: OcrWord[], region: OcrRegion, imageWidth: number, imageHeight: number): PixelBox[] {
+  const match = matchOcrLinesWithCoverage(words, region, true)
+  return edgeAwareCleanupLines({ ...match, lines: filterUsableOcrLines(match.lines, region) }, region, imageWidth, imageHeight)
 }
 
 async function regionalOcrWords(image: Buffer, region: PixelRegion, imageWidth: number, imageHeight: number, psm: number, expandVertical = false): Promise<OcrWord[]> {
@@ -589,9 +649,13 @@ async function createLineCleanupLayer(image: Buffer, region: PixelRegion, imageW
   // CV is a last resort for bubbles Tesseract could not read at all. Never mix
   // guessed CV rows into a partially matched OCR result: that caused artwork
   // and neighboring bubbles to be painted over in the old renderer.
-  const ocrLines = match.coverage >= minimumOcrCoverage && match.lines.length > 0
-  const lines = ocrLines
+  const edgeLines = edgeAwareCleanupLines(match, region, imageWidth, imageHeight)
+  const verifiedOcrLines = match.coverage >= minimumOcrCoverage && match.lines.length > 0
+  const ocrLines = verifiedOcrLines || edgeLines.length > 0
+  const lines = verifiedOcrLines
     ? match.lines
+    : edgeLines.length > 0
+      ? edgeLines
     : match.coverage < minimumOcrCoverage && match.lines.length === 0
       ? await detectVisualTextLines(image, region)
       : []
