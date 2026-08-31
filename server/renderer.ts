@@ -668,6 +668,34 @@ async function createNarrationCaptionPlate(match: OcrMatch, region: PixelRegion,
   }
 }
 
+async function narrationPlanHasColoredInk(image: Buffer, plan: NarrationCaptionPlan): Promise<boolean> {
+  const { x, y, width, height } = plan.bounds
+  const sampled = await sharp(image)
+    .extract({ left: x, top: y, width, height })
+    .removeAlpha()
+    .toColourspace('srgb')
+    .raw()
+    .toBuffer({ resolveWithObject: true })
+  let linePixels = 0
+  let coloredInkPixels = 0
+  for (let localY = 0; localY < height; localY += 1) {
+    for (let localX = 0; localX < width; localX += 1) {
+      const absoluteX = x + localX
+      const absoluteY = y + localY
+      if (!plan.lines.some((line) => absoluteX >= line.x && absoluteX < line.x + line.width && absoluteY >= line.y && absoluteY < line.y + line.height)) continue
+      linePixels += 1
+      const offset = (localY * width + localX) * sampled.info.channels
+      const r = sampled.data[offset]
+      const g = sampled.data[offset + 1]
+      const b = sampled.data[offset + 2]
+      const spread = Math.max(r, g, b) - Math.min(r, g, b)
+      const luminance = (r + g + b) / 3
+      if (spread >= 28 && luminance <= 215) coloredInkPixels += 1
+    }
+  }
+  return coloredInkPixels >= Math.max(10, Math.round(linePixels * 0.008))
+}
+
 function edgeAwareCleanupLines(match: OcrMatch, region: OcrRegion, imageWidth: number, imageHeight: number): PixelBox[] {
   if (match.coverage >= minimumOcrCoverage || match.coverage < 0.68) return []
   // Infer only one row that is physically clipped by the page. Every visible
@@ -792,6 +820,14 @@ async function createLineCleanupLayer(image: Buffer, region: PixelRegion, imageW
     if (usableRegionalMatch.lines.length > 0 && (usableRegionalMatch.complete && !match.complete || coverageDelta > 0.03 || (sourceMoreComplete && coverageDelta >= 0) || (closeCoverage && tighterOrMoreComplete) || match.lines.length === 0)) {
       rawMatch = rawRegionalMatch
       match = usableRegionalMatch
+    }
+  }
+  const safeAreaRatio = region.safe.width * region.safe.height / Math.max(1, region.width * region.height)
+  if (region.kind === 'narration' && safeAreaRatio >= 0.6) {
+    const plan = narrationCaptionPlanFromMatch(rawMatch, region, imageWidth, imageHeight)
+    if (plan && await narrationPlanHasColoredInk(image, plan)) {
+      const preferredCaption = await createNarrationCaptionPlate(rawMatch, region, imageWidth, imageHeight)
+      if (preferredCaption) return preferredCaption
     }
   }
   // CV is a last resort for bubbles Tesseract could not read at all. Never mix
@@ -997,7 +1033,7 @@ export interface RenderTranslationResult {
   renderedRegions: number
 }
 
-export async function renderTranslationDetailed(image: Buffer, result: TranslationResult): Promise<RenderTranslationResult> {
+export async function renderTranslationDetailed(image: Buffer, result: TranslationResult, ocrWordsOverride?: OcrWord[]): Promise<RenderTranslationResult> {
   const normalizedImage = await sharp(image).rotate().png().toBuffer()
   const base = sharp(normalizedImage)
   const metadata = await base.metadata()
@@ -1011,7 +1047,7 @@ export async function renderTranslationDetailed(image: Buffer, result: Translati
   if (regions.length === 0) {
     return { image: await base.webp({ quality: 92 }).toBuffer(), expectedRegions, renderedRegions: 0 }
   }
-  const ocrWords = await detectTesseractWords(normalizedImage)
+  const ocrWords = ocrWordsOverride ?? await detectTesseractWords(normalizedImage)
   const renderedRegions = await Promise.all(regions.map(async (region) => {
     let prepared = await createLineCleanupLayer(normalizedImage, region, width, height, ocrWords)
     if (!prepared) return null

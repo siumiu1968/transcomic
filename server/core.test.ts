@@ -82,6 +82,52 @@ test('renderer skips an unverified fallback instead of covering artwork', async 
   assert.ok(unverifiedInk[0] < 50)
 })
 
+test('tight frameless narration uses its verified OCR plate over the original ink', async () => {
+  const source = Buffer.from('<svg width="600" height="900" xmlns="http://www.w3.org/2000/svg"><rect width="600" height="900" fill="#ded8cb"/><rect x="115" y="125" width="60" height="25" fill="#a85f3a"/><rect x="190" y="125" width="60" height="25" fill="#a85f3a"/><rect x="265" y="125" width="55" height="25" fill="#a85f3a"/><rect x="380" y="130" width="25" height="30" fill="#3377cc"/></svg>')
+  const rendered = await renderTranslationDetailed(source, {
+    regions: [{
+      id: 1,
+      bubble: { x: 150, y: 111, width: 550, height: 100 },
+      safe: { x: 167, y: 117, width: 517, height: 89 },
+      lines: [{ x: 183, y: 133, width: 467, height: 39 }],
+      source: 'ONLY THIS LIFE',
+      translation: '呢段人生',
+      kind: 'narration',
+    }],
+  }, [
+    { x: 115, y: 125, width: 60, height: 25, confidence: 96, line: '1:1:1:1', text: 'ONLY' },
+    { x: 190, y: 125, width: 60, height: 25, confidence: 96, line: '1:1:1:1', text: 'THIS' },
+    { x: 265, y: 125, width: 55, height: 25, confidence: 95, line: '1:1:1:1', text: 'LIFE' },
+  ])
+  assert.equal(rendered.renderedRegions, 1)
+  const coveredSourceInk = await sharp(rendered.image).extract({ left: 118, top: 130, width: 1, height: 1 }).raw().toBuffer()
+  assert.ok(coveredSourceInk[0] < 50 && coveredSourceInk[1] < 50 && coveredSourceInk[2] < 50)
+  const untouchedArtwork = await sharp(rendered.image).extract({ left: 390, top: 140, width: 1, height: 1 }).raw().toBuffer()
+  assert.ok(untouchedArtwork[0] < 100 && untouchedArtwork[2] > 150)
+})
+
+test('tight black-on-white narration keeps the normal white-frame cleanup style', async () => {
+  const source = Buffer.from('<svg width="600" height="900" xmlns="http://www.w3.org/2000/svg"><rect width="600" height="900" fill="#fff"/><rect x="115" y="125" width="60" height="25" fill="#111"/><rect x="190" y="125" width="60" height="25" fill="#111"/><rect x="265" y="125" width="55" height="25" fill="#111"/></svg>')
+  const rendered = await renderTranslationDetailed(source, {
+    regions: [{
+      id: 1,
+      bubble: { x: 150, y: 111, width: 550, height: 100 },
+      safe: { x: 167, y: 117, width: 517, height: 89 },
+      lines: [{ x: 183, y: 133, width: 467, height: 39 }],
+      source: 'ONLY THIS LIFE',
+      translation: '呢段人生',
+      kind: 'narration',
+    }],
+  }, [
+    { x: 115, y: 125, width: 60, height: 25, confidence: 96, line: '1:1:1:1', text: 'ONLY' },
+    { x: 190, y: 125, width: 60, height: 25, confidence: 96, line: '1:1:1:1', text: 'THIS' },
+    { x: 265, y: 125, width: 55, height: 25, confidence: 95, line: '1:1:1:1', text: 'LIFE' },
+  ])
+  assert.equal(rendered.renderedRegions, 1)
+  const cleanedSourceInk = await sharp(rendered.image).extract({ left: 118, top: 130, width: 1, height: 1 }).raw().toBuffer()
+  assert.ok(cleanedSourceInk[0] > 230 && cleanedSourceInk[1] > 230 && cleanedSourceInk[2] > 230)
+})
+
 test('visual fallback accepts tall colored lettering only when model geometry backs it', async () => {
   const source = Buffer.from('<svg width="600" height="900" xmlns="http://www.w3.org/2000/svg"><rect width="600" height="900" fill="#fff"/><rect x="240" y="365" width="20" height="38" fill="#985f38"/><rect x="270" y="365" width="24" height="38" fill="#985f38"/><rect x="330" y="388" width="8" height="8" fill="#985f38"/><rect x="343" y="388" width="8" height="8" fill="#985f38"/></svg>')
   const region = {
