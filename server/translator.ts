@@ -402,16 +402,29 @@ function looksLikeSfxText(value: string): boolean {
     && !dialogueSingletons.has(words[0] ?? '')
 }
 
+function hintSourceMatchesRegion(hintText: string, source: string): boolean {
+  const normalizeWords = (value: string) => latinWords(value)
+    .map((word) => word.replace(/['’]/gu, '').toLocaleLowerCase())
+    .filter((word) => word.length >= 2)
+  const hintWords = normalizeWords(hintText)
+  const sourceWords = new Set(normalizeWords(source))
+  return hintWords.length > 0 && hintWords.every((word) => sourceWords.has(word))
+}
+
 function hintIsCovered(hint: OcrHint, regions: TranslationRegion[]): boolean {
   const hintRight = hint.box.x + hint.box.width
   const hintBottom = hint.box.y + hint.box.height
   const hintArea = Math.max(1, hint.box.width * hint.box.height)
+  const overlapRatio = (box: TranslationBox) => {
+    const left = Math.max(hint.box.x, box.x)
+    const top = Math.max(hint.box.y, box.y)
+    const right = Math.min(hintRight, box.x + box.width)
+    const bottom = Math.min(hintBottom, box.y + box.height)
+    return Math.max(0, right - left) * Math.max(0, bottom - top) / hintArea
+  }
   return regions.some((region) => {
-    const left = Math.max(hint.box.x, region.safe.x)
-    const top = Math.max(hint.box.y, region.safe.y)
-    const right = Math.min(hintRight, region.safe.x + region.safe.width)
-    const bottom = Math.min(hintBottom, region.safe.y + region.safe.height)
-    return Math.max(0, right - left) * Math.max(0, bottom - top) / hintArea >= 0.45
+    if (overlapRatio(region.safe) >= 0.45) return true
+    return overlapRatio(region.bubble) >= 0.45 && hintSourceMatchesRegion(hint.text, region.source)
   })
 }
 

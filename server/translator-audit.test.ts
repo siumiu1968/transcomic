@@ -127,6 +127,26 @@ test('OCR completeness gate catches obvious clipped dialogue outside translated 
   ])
 })
 
+test('OCR completeness gate accepts source-matched OCR inside a bubble but outside its narrow safe box', () => {
+  const translated = parseTranslationOutput(JSON.stringify({ regions: [{
+    id: 1,
+    bubble: { x: 792, y: 15, width: 208, height: 205 },
+    safe: { x: 887, y: 56, width: 97, height: 71 },
+    lines: [{ x: 900, y: 65, width: 70, height: 20 }],
+    source: 'HUFF, HUFF... WHY...',
+    translation: '呼、呼……點解……',
+    kind: 'speech',
+  }] }))
+  const fragmentedHints = [
+    { text: 'UFE', box: { x: 847, y: 52, width: 74, height: 24 }, confidence: 67 },
+    { text: 'WHY...', box: { x: 838, y: 93, width: 85, height: 27 }, confidence: 100 },
+  ]
+  const unrelatedHint = { text: 'RUN NOW', box: { x: 805, y: 150, width: 100, height: 24 }, confidence: 98 }
+
+  assert.deepEqual(findUncoveredDialogueHints(fragmentedHints, translated), [])
+  assert.deepEqual(findUncoveredDialogueHints([unrelatedHint], translated).map(({ text }) => text), ['RUN NOW'])
+})
+
 test('OCR completeness gate joins nearby short rows but ignores isolated SFX and credits', () => {
   const hints = [
     { text: 'OLD', box: { x: 410, y: 30, width: 50, height: 18 }, confidence: 95 },
