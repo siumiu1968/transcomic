@@ -235,9 +235,18 @@ test('completeness pipeline fails closed when the bounded third pass returns no 
     withCompletenessRepair({ regions: [] }, hints, async () => ({ regions: [] })),
     (error: unknown) => {
       assert.ok(error instanceof TranslationCompletenessError)
-      assert.deepEqual(error.partialResult, { regions: [] })
+      assert.deepEqual(error.partialResult, { regions: [], memory_delta: [] })
       assert.deepEqual(error.unresolvedHints, hints)
       return true
     },
   )
+})
+
+test('completeness pipeline accepts OCR candidates explicitly classified as non-dialogue', async () => {
+  const hints = [{ text: 'COFFEE SHOP', box: { x: 100, y: 100, width: 240, height: 80 }, confidence: 96 }]
+  const result = await withCompletenessRepair({ regions: [] }, hints, async () => ({
+    regions: [],
+    ignored_ocr: [1],
+  }))
+  assert.deepEqual(result.regions, [])
 })

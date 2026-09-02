@@ -6,9 +6,10 @@ TransComic 係一個網頁漫畫翻譯工作台：由獲授權嘅 Comix 來源�
 
 - 搜尋 Comix 目錄，只有明確加入書庫嘅作品先會處理
 - 逐話、未翻譯章節或全選批次翻譯
-- 可續跑嘅單工翻譯佇列，支援取消、進度同失敗狀態
+- 可續跑嘅並行章節翻譯佇列，支援取消、進度同失敗狀態
 - GPT-5.6 Luna 三種推理強度選擇，最高品質使用 Max
-- 保留作品簡介、上章尾段同最近兩頁對白，維持人物稱謂與前文後理
+- 保留作品簡介、前文對白及作品級角色／地點／術語／稱謂記憶
+- RapidOCR + Tesseract 查漏，嵌字後再次 OCR；殘留原文會安全重試或明確標記失敗
 - 視覺文字定位、繁體中文（香港用語）翻譯及漫畫頁面合成
 - 長條、單頁、雙頁、右至左、縮放、全螢幕及手機閱讀模式
 - SQLite 本機資料庫；原圖、譯圖同憑證唔會提交到 Git
@@ -20,15 +21,18 @@ TransComic 係一個網頁漫畫翻譯工作台：由獲授權嘅 Comix 來源�
 - Express 5 + Node.js SQLite
 - Patchright（已授權網頁連接）
 - Codex CLI 或 OpenAI Responses API（圖像輸入 + 結構化輸出）
-- Tesseract OCR（對白查漏同原文字行定位）
+- RapidOCR + Tesseract OCR（多引擎對白查漏、原文字行定位同成品驗收）
 - Sharp（頁面正規化與譯文合成）
 
 ## 本機啟動
 
-需要 Node.js 22 或以上、Chromium、Tesseract 英文語言資料，以及已登入嘅 Codex CLI；亦可改用有效嘅 OpenAI API key。
+需要 Node.js 22 或以上、Python 3.10 或以上、Chromium、Tesseract 英文語言資料，以及已登入嘅 Codex CLI；亦可改用有效嘅 OpenAI API key。
 
 ```bash
 cp .env.example .env
+python3 -m venv .venv-ocr
+.venv-ocr/bin/pip install -r requirements-ocr.txt
+# 將 .env 嘅 OCR_PYTHON_PATH 設為 .venv-ocr/bin/python
 npm ci --ignore-scripts
 npm run dev
 ```

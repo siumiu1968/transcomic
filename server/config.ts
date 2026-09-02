@@ -33,6 +33,17 @@ function translationModel(name: string): 'gpt-5.6-luna' {
   return assertTranslationModel(process.env[name]?.trim() || 'gpt-5.6-luna', name)
 }
 
+const supportedOcrEngines = ['rapidocr', 'paddleocr', 'tesseract'] as const
+export type OcrEngineName = typeof supportedOcrEngines[number]
+
+export function ocrEngines(value = process.env.OCR_ENGINES): OcrEngineName[] {
+  const requested = (value ?? 'rapidocr,tesseract')
+    .split(',')
+    .map((engine) => engine.trim().toLowerCase())
+    .filter((engine): engine is OcrEngineName => supportedOcrEngines.includes(engine as OcrEngineName))
+  return [...new Set([...requested, 'tesseract' as const])]
+}
+
 export const config = {
   host: process.env.HOST ?? '127.0.0.1',
   port: integer('PORT', 4178),
@@ -53,6 +64,11 @@ export const config = {
   effortAudit: reasoningEffort('TRANSLATION_EFFORT_AUDIT', 'low'),
   translationChapterConcurrency: boundedInteger('TRANSLATION_CHAPTER_CONCURRENCY', 2, 1, 4),
   maxImageEdge: integer('MAX_IMAGE_EDGE', 2048),
+  ocrEngines: ocrEngines(),
+  tesseractPath: process.env.TESSERACT_PATH ?? 'tesseract',
+  ocrPythonPath: process.env.OCR_PYTHON_PATH ?? 'python3',
+  ocrWorkerPath: path.resolve(process.env.OCR_WORKER_PATH ?? './server/ocr_worker.py'),
+  ocrWorkerTimeoutMs: boundedInteger('OCR_WORKER_TIMEOUT_SECONDS', 45, 5, 180) * 1000,
   translationBackend: process.env.TRANSLATION_BACKEND ?? 'openai',
   codexCliPath: process.env.CODEX_CLI_PATH ?? 'codex',
   codexTimeoutMs: integer('CODEX_TIMEOUT_SECONDS', 300) * 1000,

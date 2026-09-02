@@ -19,6 +19,9 @@ data/
 *.sqlite*
 .cache/
 coverage/
+.venv-ocr/
+__pycache__/
+*.pyc
 
 # Editor directories and files
 .vscode/*

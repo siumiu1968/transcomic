@@ -7,9 +7,16 @@ import sharp from 'sharp'
 import { isAllowedSourceUrl } from './comix.js'
 import { config } from './config.js'
 import { hasTranslationOutput, Store } from './db.js'
+import type { OcrDetection } from './ocr.js'
 import { completionStatus, TranslationQueue } from './queue.js'
 import { balanceTranslationLines, detectVisualTextLines, filterUsableOcrLines, matchEdgeClippedOcrLines, matchOcrLines, modelBackedVisualLinesAreTight, normalizeDisplayText, planNarrationCaption, renderTranslation, renderTranslationDetailed } from './renderer.js'
 import { codexTimeoutForEffort, mergeTranslationResults, parseTranslationOutput, withAuditFallback } from './translator.js'
+
+const successfulEmptyOcr = async (): Promise<OcrDetection> => ({
+  words: [],
+  successfulEngines: ['tesseract'],
+  failedEngines: [],
+})
 
 test('source image allowlist blocks SSRF targets', () => {
   assert.equal(isAllowedSourceUrl('https://static.comix.to/poster.webp'), true)
@@ -445,10 +452,34 @@ test('translation output parser accepts strict and fenced JSON', () => {
     source: 'Hello',
     translation: '你好',
     kind: 'speech' as const,
-  }] }
+  }], memory_delta: [] }
   assert.deepEqual(parseTranslationOutput(JSON.stringify(expected)), expected)
   assert.deepEqual(parseTranslationOutput(`\`\`\`json\n${JSON.stringify(expected)}\n\`\`\``), expected)
-  assert.deepEqual(parseTranslationOutput(JSON.stringify({ regions: [{ bubble: {}, safe: {}, translation: '錯誤框', kind: 'speech' }] })), { regions: [] })
+  assert.deepEqual(parseTranslationOutput(JSON.stringify({ regions: [{ bubble: {}, safe: {}, translation: '錯誤框', kind: 'speech' }] })), { regions: [], memory_delta: [] })
+})
+
+test('translation output parser assigns unique region ids before residual retries', () => {
+  const parsed = parseTranslationOutput(JSON.stringify({ regions: [
+    {
+      id: 1,
+      bubble: { x: 100, y: 100, width: 200, height: 180 },
+      safe: { x: 125, y: 125, width: 150, height: 100 },
+      lines: [{ x: 140, y: 140, width: 120, height: 30 }],
+      source: 'First',
+      translation: '第一',
+      kind: 'speech',
+    },
+    {
+      id: 1,
+      bubble: { x: 600, y: 100, width: 200, height: 180 },
+      safe: { x: 625, y: 125, width: 150, height: 100 },
+      lines: [{ x: 640, y: 140, width: 120, height: 30 }],
+      source: 'Second',
+      translation: '第二',
+      kind: 'speech',
+    },
+  ] }))
+  assert.deepEqual(parsed.regions.map(({ id }) => id), [1, 2])
 })
 
 test('audit merge adds only a distinct missed bubble in reading order', () => {
@@ -532,7 +563,7 @@ test('stopping the queue requeues an interrupted active page', async () => {
     const comix = {
       getChapterPages: async () => [sourcePage],
     } as unknown as ConstructorParameters<typeof TranslationQueue>[1]
-    const queue = new TranslationQueue(store, comix, translator)
+    const queue = new TranslationQueue(store, comix, translator, config.translationChapterConcurrency, successfulEmptyOcr)
     queue.start()
     await started
     const stopped = queue.stop()

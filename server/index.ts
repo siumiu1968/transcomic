@@ -4,6 +4,7 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import { config } from './config.js'
 import { ComixClient } from './comix.js'
 import { hasTranslationOutput, Store } from './db.js'
+import { shutdownOcrWorkers } from './ocr.js'
 import { TranslationQueue } from './queue.js'
 import { MangaTranslator } from './translator.js'
 import type { TranslationMode } from './types.js'
@@ -218,6 +219,7 @@ function shutdown(): Promise<void> {
       server.close((error) => error ? reject(error) : resolve())
     })
     await Promise.all([closeServer, queue.stop()])
+    await shutdownOcrWorkers()
     await Promise.all([comix.close(), mediaComix.close()])
     store.db.close()
   })()

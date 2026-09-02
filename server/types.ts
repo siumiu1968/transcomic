@@ -52,6 +52,25 @@ export interface TranslationBox {
 
 export interface TranslationResult {
   regions: TranslationRegion[]
+  /** Optional only for reading translation JSON written before series memory existed. */
+  memory_delta?: TranslationMemoryDelta[]
+  /** Candidate numbers which the bounded OCR repair explicitly classified as non-dialogue. */
+  ignored_ocr?: number[]
+}
+
+export type TranslationMemoryCategory = 'character' | 'place' | 'term' | 'address' | 'voice'
+
+export interface TranslationMemoryDelta {
+  category: TranslationMemoryCategory
+  source: string
+  translation: string
+  note: string
+}
+
+export interface SeriesMemoryEntry extends TranslationMemoryDelta {
+  series_hid: string
+  source_key: string
+  created_at: string
 }
 
 export interface SeriesRow {

@@ -7,7 +7,8 @@ import { hasTranslationOutput, type Store } from './db.js'
 import type { ComixClient } from './comix.js'
 import { isTranslationCompletenessError, parseTranslationOutput, type MangaTranslator, type TranslationContext } from './translator.js'
 import type { JobRow, TranslationMode, TranslationResult } from './types.js'
-import { renderTranslationDetailed } from './renderer.js'
+import { detectOcrWordsDetailed, type OcrDetection } from './ocr.js'
+import { findResidualSourceText, renderTranslationDetailed } from './renderer.js'
 
 async function atomicWrite(target: string, content: Buffer): Promise<void> {
   await fs.mkdir(path.dirname(target), { recursive: true })
@@ -24,7 +25,7 @@ function translationContext(values: string[], seriesTitle: string, synopsis: str
       return []
     }
   })
-  return { seriesTitle, synopsis, previousRegions }
+  return { seriesTitle, synopsis, previousRegions, seriesMemory: [] }
 }
 
 export function completionStatus(needsRetranslation: boolean): Pick<JobRow, 'status' | 'error'> {
@@ -33,11 +34,14 @@ export function completionStatus(needsRetranslation: boolean): Pick<JobRow, 'sta
     : { status: 'completed', error: '' }
 }
 
+export type OcrDetector = (image: Buffer, psm?: number) => Promise<OcrDetection>
+
 export class TranslationQueue {
   private readonly pending: string[] = []
   private readonly scheduled = new Set<string>()
   private readonly activeTasks = new Set<Promise<void>>()
   private readonly activeChapterIds = new Set<number>()
+  private readonly activeSeriesHids = new Set<string>()
   private readonly workerLimit: number
   private stopping = false
   private drainTask?: Promise<void>
@@ -49,6 +53,7 @@ export class TranslationQueue {
     private readonly comix: ComixClient,
     private readonly translator: MangaTranslator,
     concurrency = config.translationChapterConcurrency,
+    private readonly detectOcr: OcrDetector = detectOcrWordsDetailed,
   ) {
     this.workerLimit = Number.isSafeInteger(concurrency) && concurrency > 0 ? Math.min(concurrency, 4) : 1
   }
@@ -69,8 +74,18 @@ export class TranslationQueue {
   enqueue(chapterIds: number[], mode: TranslationMode, forceChapterIds: ReadonlySet<number> = new Set()): JobRow[] {
     const profile = this.translator.profileFor(mode)
     const jobs: JobRow[] = []
-    for (const chapterId of chapterIds) {
-      if (!this.store.getChapter(chapterId)) continue
+    const normalSchedules: string[] = []
+    const prioritySchedules: string[] = []
+    const chapters = chapterIds.flatMap((chapterId) => {
+      const chapter = this.store.getChapter(chapterId)
+      return chapter ? [chapter] : []
+    }).sort((left, right) => (
+      left.series_hid.localeCompare(right.series_hid)
+      || left.number - right.number
+      || left.id - right.id
+    ))
+    for (const chapter of chapters) {
+      const chapterId = chapter.id
       const active = this.store.activeJobForChapter(chapterId)
       if (active) {
         jobs.push(active)
@@ -81,8 +96,12 @@ export class TranslationQueue {
       this.store.createJob({ id, chapter_id: chapterId, model: profile.model, reasoning_effort: profile.effort })
       const job = this.store.getJob(id)
       if (job) jobs.push(job)
-      this.schedule(id, forceChapterIds.has(chapterId))
+      if (forceChapterIds.has(chapterId)) prioritySchedules.push(id)
+      else normalSchedules.push(id)
     }
+    normalSchedules.forEach((id) => this.schedule(id))
+    // schedule(priority) prepends, so reverse iteration preserves chapter order.
+    prioritySchedules.reverse().forEach((id) => this.schedule(id, true))
     return jobs
   }
 
@@ -155,7 +174,13 @@ export class TranslationQueue {
         if (id) this.scheduled.delete(id)
         continue
       }
-      if (this.activeChapterIds.has(job.chapter_id)) {
+      const chapter = this.store.getChapter(job.chapter_id)
+      if (!chapter) {
+        this.pending.splice(index, 1)
+        this.scheduled.delete(job.id)
+        continue
+      }
+      if (this.activeChapterIds.has(job.chapter_id) || this.activeSeriesHids.has(chapter.series_hid)) {
         index += 1
         continue
       }
@@ -167,10 +192,13 @@ export class TranslationQueue {
   }
 
   private startJob(job: JobRow): void {
+    const seriesHid = this.store.getChapter(job.chapter_id)?.series_hid
     this.activeChapterIds.add(job.chapter_id)
+    if (seriesHid) this.activeSeriesHids.add(seriesHid)
     const task = this.process(job).finally(() => {
       this.activeTasks.delete(task)
       this.activeChapterIds.delete(job.chapter_id)
+      if (seriesHid) this.activeSeriesHids.delete(seriesHid)
     })
     this.activeTasks.add(task)
   }
@@ -254,11 +282,39 @@ export class TranslationQueue {
           this.requeueAfterShutdown(job, chapter.id, activePosition)
           return
         }
+        const originalDetection = await this.detectOcr(original)
+        if (this.stopping) {
+          this.requeueAfterShutdown(job, chapter.id, activePosition)
+          return
+        }
+        if (this.store.getJob(job.id)?.status === 'cancelled') {
+          this.store.updatePage(chapter.id, page.position, { status: 'pending', error: '' })
+          return
+        }
+        if (originalDetection.successfulEngines.length === 0) {
+          needsRetranslation = true
+          this.store.updatePage(chapter.id, page.position, {
+            translated_path: '',
+            translation_json: '',
+            status: 'needs_retranslation',
+            error: 'OCR 引擎全部不可用，未能安全檢查原文，請重譯',
+          })
+          this.store.updateJob(job.id, { current_page: page.position })
+          continue
+        }
+        const originalOcr = originalDetection.words
+        const contextValues = [...priorChapterContext, ...currentChapterContext.slice(-2)]
         const context = translationContext(
-          [...priorChapterContext, ...currentChapterContext.slice(-2)],
+          contextValues,
           series?.title ?? job.series_title,
           series?.synopsis ?? '',
         )
+        context.seriesMemory = this.store.seriesMemory(chapter.series_hid, [
+          context.seriesTitle,
+          context.synopsis,
+          ...context.previousRegions.flatMap(({ source, translation }) => [source, translation]),
+          originalOcr.map(({ text }) => text).join(' ').slice(0, 4_000),
+        ].join('\n'), 24)
         let translation: TranslationResult
         try {
           translation = await this.translator.translate(original, job.model, job.reasoning_effort, context)
@@ -285,7 +341,7 @@ export class TranslationQueue {
           continue
         }
         const translationJson = JSON.stringify(translation)
-        const rendered = await renderTranslationDetailed(original, translation)
+        let rendered = await renderTranslationDetailed(original, translation, { ocrWordsOverride: originalOcr })
         if (this.stopping) {
           this.requeueAfterShutdown(job, chapter.id, activePosition)
           return
@@ -306,6 +362,55 @@ export class TranslationQueue {
           this.store.updateJob(job.id, { current_page: page.position })
           continue
         }
+        if (rendered.expectedRegions > 0) {
+          const dimensions = {
+            imageWidth: metadata.width ?? page.width ?? 1,
+            imageHeight: metadata.height ?? page.height ?? 1,
+          }
+          let renderedDetection = await this.detectOcr(rendered.image)
+          let ocrUnavailable = renderedDetection.successfulEngines.length === 0
+          let residual = ocrUnavailable
+            ? []
+            : findResidualSourceText(originalOcr, renderedDetection.words, translation.regions, dimensions)
+          if (!ocrUnavailable && residual.length > 0) {
+            rendered = await renderTranslationDetailed(original, translation, {
+              ocrWordsOverride: originalOcr,
+              aggressiveRegionIds: residual.map(({ regionId }) => regionId),
+            })
+            if (rendered.renderedRegions === rendered.expectedRegions) {
+              renderedDetection = await this.detectOcr(rendered.image)
+              ocrUnavailable = renderedDetection.successfulEngines.length === 0
+              residual = ocrUnavailable
+                ? []
+                : findResidualSourceText(originalOcr, renderedDetection.words, translation.regions, dimensions)
+            }
+          }
+          if (ocrUnavailable || rendered.renderedRegions !== rendered.expectedRegions || residual.length > 0) {
+            needsRetranslation = true
+            const detail = residual.slice(0, 3).map(({ residualText }) => residualText).join('／')
+            this.store.updatePage(chapter.id, page.position, {
+              translated_path: '',
+              translation_json: translationJson,
+              status: 'needs_retranslation',
+              error: ocrUnavailable
+                ? 'OCR 引擎全部不可用，未能安全檢查嵌字結果，請重譯'
+                : residual.length > 0
+                ? `嵌字後仍檢測到英文殘留${detail ? `：${detail}` : ''}，請重譯`
+                : `有 ${rendered.expectedRegions - rendered.renderedRegions} 個對白未能安全清除原文，請重譯`,
+            })
+            currentChapterContext.push(translationJson)
+            this.store.updateJob(job.id, { current_page: page.position })
+            continue
+          }
+        }
+        if (this.stopping) {
+          this.requeueAfterShutdown(job, chapter.id, activePosition)
+          return
+        }
+        if (this.store.getJob(job.id)?.status === 'cancelled') {
+          this.store.updatePage(chapter.id, page.position, { status: 'pending', error: '' })
+          return
+        }
         await atomicWrite(path.join(config.dataDir, translatedRelative), rendered.image)
         if (this.stopping) {
           this.requeueAfterShutdown(job, chapter.id, activePosition)
@@ -315,12 +420,13 @@ export class TranslationQueue {
           this.store.updatePage(chapter.id, page.position, { status: 'pending', error: '' })
           return
         }
-        this.store.updatePage(chapter.id, page.position, {
-          translated_path: translatedRelative,
-          translation_json: translationJson,
-          status: 'completed',
-          error: '',
-        })
+        this.store.completePageTranslation(
+          chapter.id,
+          page.position,
+          translatedRelative,
+          translationJson,
+          translation.memory_delta ?? [],
+        )
         currentChapterContext.push(translationJson)
         this.store.updateJob(job.id, { current_page: page.position })
       }

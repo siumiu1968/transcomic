@@ -1,5 +1,5 @@
 import sharp from 'sharp'
-import { detectTesseractWords, type OcrWord } from './ocr.js'
+import { detectOcrWords, detectTesseractWords, type OcrWord } from './ocr.js'
 import type { TranslationRegion, TranslationResult } from './types.js'
 
 const MIN_FONT_SIZE = 12
@@ -15,6 +15,7 @@ interface PixelBox {
 }
 
 interface PixelRegion extends PixelBox {
+  id: number
   safe: PixelBox
   lines: PixelBox[]
   source: string
@@ -114,7 +115,7 @@ function toPixelRegion(region: TranslationRegion, imageWidth: number, imageHeigh
   if (safe.x < x || safe.y < y || safe.x + safe.width > x + width || safe.y + safe.height > y + height) return null
   if (width > imageWidth * 0.65 && height < imageHeight * 0.08) return null
   if (lines.some((line) => line.x < safe.x - 1 || line.y < safe.y - 1 || line.x + line.width > safe.x + safe.width + 1 || line.y + line.height > safe.y + safe.height + 1)) return null
-  return { ...bubble, safe, lines, source: region.source, text, kind: region.kind === 'narration' ? 'narration' : 'speech' }
+  return { id: region.id, ...bubble, safe, lines, source: region.source, text, kind: region.kind === 'narration' ? 'narration' : 'speech' }
 }
 
 async function createTextLayer(region: PixelRegion, imageWidth: number): Promise<{ input: Buffer; top: number; left: number } | null> {
@@ -379,6 +380,161 @@ function editDistance(left: string, right: string): number {
     for (let index = 0; index < current.length; index += 1) previous[index] = current[index]
   }
   return previous[right.length]
+}
+
+export interface ResidualSourceText {
+  regionId: number
+  source: string
+  residualText: string
+  matchedWords: string[]
+  sourceCoverage: number
+  bounds: PixelBox
+}
+
+export interface ResidualSourceTextOptions {
+  imageWidth: number
+  imageHeight: number
+  minimumSourceConfidence?: number
+  minimumRenderedConfidence?: number
+}
+
+const NON_DIALOGUE_SOURCE_PATTERN = /(?:https?:\/\/|www\.|\.com\b|\.net\b|\.org\b|(?:all rights reserved)|(?:do not (?:repost|distribute))|copyright|©)/iu
+const CREDIT_SOURCE_PATTERN = /(?:scanlat|translat|typeset|letter(?:er|ing)?|proofread|cleaner|editor|raw(?:s| provider)?|credit|watermark|patreon|instagram|facebook|twitter)\b/iu
+
+function isResidualQaEligibleRegion(region: TranslationRegion): boolean {
+  if (region.kind === 'sfx' || NON_DIALOGUE_SOURCE_PATTERN.test(region.source)) return false
+  const latin = region.source.match(/[A-Za-z]+/gu) ?? []
+  const safeTouchesPageEdge = region.safe.x <= 30 || region.safe.y <= 30
+    || region.safe.x + region.safe.width >= 970 || region.safe.y + region.safe.height >= 970
+  const startsLikeCredit = /^\s*(?:scanlat|translat|typeset|letter(?:er|ing)?|proofread|cleaner|editor|raws?|credits?|watermark)\b/iu.test(region.source)
+  if (latin.length <= 8 && CREDIT_SOURCE_PATTERN.test(region.source) && (startsLikeCredit || safeTouchesPageEdge)) return false
+  return latin.some((word) => word.length >= 2)
+}
+
+function sourceTokenMatch(value: string, source: string): boolean {
+  if (!value || !source) return false
+  const candidates = ocrWordVariants(value)
+  return candidates.some((candidate) => {
+    if (candidate === source) return true
+    if (source.length >= 4 && candidate.includes(source)) return true
+    if (candidate.length >= 4 && source.includes(candidate)) return true
+    const maximumDistance = source.length >= 8 ? 2 : source.length >= 4 ? 1 : 0
+    return editDistance(candidate, source) <= maximumDistance
+  })
+}
+
+function wordInsideBounds(word: OcrWord, bounds: PixelBox, marginRatio: number): boolean {
+  const centreX = word.x + word.width / 2
+  const centreY = word.y + word.height / 2
+  return centreX >= bounds.x - bounds.width * marginRatio
+    && centreX <= bounds.x + bounds.width * (1 + marginRatio)
+    && centreY >= bounds.y - bounds.height * marginRatio
+    && centreY <= bounds.y + bounds.height * (1 + marginRatio)
+}
+
+function sameWordPosition(source: OcrWord, rendered: OcrWord): { same: boolean; overlap: number } {
+  const left = Math.max(source.x, rendered.x)
+  const top = Math.max(source.y, rendered.y)
+  const right = Math.min(source.x + source.width, rendered.x + rendered.width)
+  const bottom = Math.min(source.y + source.height, rendered.y + rendered.height)
+  const intersection = Math.max(0, right - left) * Math.max(0, bottom - top)
+  const overlap = intersection / Math.max(1, Math.min(source.width * source.height, rendered.width * rendered.height))
+  const deltaX = Math.abs(source.x + source.width / 2 - rendered.x - rendered.width / 2)
+  const deltaY = Math.abs(source.y + source.height / 2 - rendered.y - rendered.height / 2)
+  const widthRatio = rendered.width / Math.max(1, source.width)
+  const heightRatio = rendered.height / Math.max(1, source.height)
+  return {
+    same: (overlap >= 0.35 || deltaX <= Math.max(source.width, rendered.width) * 0.32)
+      && deltaY <= Math.max(source.height, rendered.height) * 0.45
+      && widthRatio >= 0.5 && widthRatio <= 1.9
+      && heightRatio >= 0.5 && heightRatio <= 1.9,
+    overlap,
+  }
+}
+
+/**
+ * Finds source-language words which OCR sees in the same place before and
+ * after rendering. Geometry and the model source must both agree, so unrelated
+ * page text, credits, watermarks and SFX are not promoted to cleanup targets.
+ */
+export function findResidualSourceText(
+  sourceWords: OcrWord[],
+  renderedWords: OcrWord[],
+  regions: TranslationRegion[],
+  options: ResidualSourceTextOptions,
+): ResidualSourceText[] {
+  const sourceConfidence = options.minimumSourceConfidence ?? 35
+  const renderedConfidence = options.minimumRenderedConfidence ?? 45
+  return regions.flatMap((region): ResidualSourceText[] => {
+    if (!isResidualQaEligibleRegion(region)) return []
+    const convert = (box: TranslationRegion['safe']): PixelBox => {
+      const x = Math.max(0, Math.round(box.x / 1000 * options.imageWidth))
+      const y = Math.max(0, Math.round(box.y / 1000 * options.imageHeight))
+      return {
+        x,
+        y,
+        width: Math.max(0, Math.min(options.imageWidth - x, Math.round(box.width / 1000 * options.imageWidth))),
+        height: Math.max(0, Math.min(options.imageHeight - y, Math.round(box.height / 1000 * options.imageHeight))),
+      }
+    }
+    const safe = convert(region.safe)
+    if (safe.width < 8 || safe.height < 8) return []
+    const retainedTranslationTokens = new Set(
+      (region.translation.match(/[A-Za-z]+/gu) ?? []).map((word) => normalizedWord(word)),
+    )
+    const sourceTokens = (region.source.match(/[A-Za-z]+/gu) ?? [])
+      .map((word) => normalizedWord(word))
+      .filter((word) => !retainedTranslationTokens.has(word))
+    if (sourceTokens.length === 0) return []
+    const originalCandidates = sourceWords.filter((word) => {
+      const normalized = normalizedWord(word.text)
+      return word.confidence >= sourceConfidence
+        && /[a-z]/u.test(normalized)
+        && wordInsideBounds(word, safe, 0.2)
+        && sourceTokens.some((token) => sourceTokenMatch(normalized, token))
+    })
+    const matches: Array<{ token: string; sourceWord: OcrWord; renderedWord: OcrWord; overlap: number }> = []
+    for (const sourceWord of originalCandidates) {
+      const original = normalizedWord(sourceWord.text)
+      const token = sourceTokens.find((candidate) => sourceTokenMatch(original, candidate))
+      if (!token) continue
+      let best: { word: OcrWord; overlap: number } | undefined
+      for (const renderedWord of renderedWords) {
+        const rendered = normalizedWord(renderedWord.text)
+        if (renderedWord.confidence < renderedConfidence
+          || !/[a-z]/u.test(rendered)
+          || !wordInsideBounds(renderedWord, safe, 0.2)
+          || !sourceTokenMatch(rendered, token)) continue
+        const position = sameWordPosition(sourceWord, renderedWord)
+        if (!position.same || best && best.overlap >= position.overlap) continue
+        best = { word: renderedWord, overlap: position.overlap }
+      }
+      if (best) matches.push({ token, sourceWord, renderedWord: best.word, overlap: best.overlap })
+    }
+    if (matches.length === 0) return []
+    const uniqueTokens = [...new Set(matches.map((match) => match.token))]
+    const matchedCharacters = uniqueTokens.reduce((total, token) => total + token.length, 0)
+    const totalCharacters = sourceTokens.reduce((total, token) => total + token.length, 0)
+    const sourceCoverage = matchedCharacters / Math.max(1, totalCharacters)
+    const strongSingle = matches.some((match) => match.token.length >= 2
+      && match.sourceWord.confidence >= 85
+      && match.renderedWord.confidence >= 85
+      && match.overlap >= 0.55)
+    if (!strongSingle && uniqueTokens.length < 2 && (matchedCharacters < 5 || sourceCoverage < 0.35)) return []
+    const boxes = matches.map((match) => match.renderedWord)
+    const left = Math.min(...boxes.map((box) => box.x))
+    const top = Math.min(...boxes.map((box) => box.y))
+    const right = Math.max(...boxes.map((box) => box.x + box.width))
+    const bottom = Math.max(...boxes.map((box) => box.y + box.height))
+    return [{
+      regionId: region.id,
+      source: region.source,
+      residualText: uniqueTokens.join(' '),
+      matchedWords: uniqueTokens,
+      sourceCoverage,
+      bounds: { x: left, y: top, width: right - left, height: bottom - top },
+    }]
+  })
 }
 
 interface OcrLine extends PixelBox {
@@ -783,7 +939,30 @@ async function regionalOcrWords(image: Buffer, region: PixelRegion, imageWidth: 
   return mappedWords.filter((word) => word.height >= minimumWordHeight)
 }
 
-async function createLineCleanupLayer(image: Buffer, region: PixelRegion, imageWidth: number, imageHeight: number, ocrWords: OcrWord[]): Promise<PreparedLayer | null> {
+function aggressiveCleanupIsSafe(match: OcrMatch, region: PixelRegion): boolean {
+  if (!match.complete || match.coverage < minimumOcrCoverage || match.lines.length === 0) return false
+  if (match.lines.some((line) => line.confidence < 35) || median(match.lines.map((line) => line.confidence)) < 60) return false
+  if (region.lines.length > 0 && match.lines.length > region.lines.length + 2) return false
+  const padding = Math.max(3, Math.round(median(match.lines.map((line) => line.height)) * 0.42))
+  const boxes = match.lines.map((line) => ({
+    x: line.x - padding,
+    y: line.y - padding,
+    width: line.width + padding * 2,
+    height: line.height + padding * 2,
+  }))
+  const envelopeMarginX = region.safe.width * 0.22
+  const envelopeMarginY = region.safe.height * 0.22
+  if (boxes.some((box) => box.x < region.x || box.y < region.y
+    || box.x + box.width > region.x + region.width || box.y + box.height > region.y + region.height
+    || box.x < region.safe.x - envelopeMarginX || box.y < region.safe.y - envelopeMarginY
+    || box.x + box.width > region.safe.x + region.safe.width + envelopeMarginX
+    || box.y + box.height > region.safe.y + region.safe.height + envelopeMarginY)) return false
+  const totalArea = boxes.reduce((total, box) => total + box.width * box.height, 0)
+  return totalArea <= region.width * region.height * 0.32
+    && totalArea <= region.safe.width * region.safe.height * 1.15
+}
+
+async function createLineCleanupLayer(image: Buffer, region: PixelRegion, imageWidth: number, imageHeight: number, ocrWords: OcrWord[], aggressive = false): Promise<PreparedLayer | null> {
   let rawMatch = matchOcrLinesWithCoverage(ocrWords, region)
   let match = { ...rawMatch, lines: filterUsableOcrLines(rawMatch.lines, region) }
   // Full-page OCR is fast, but a bubble crop is much more accurate for small or
@@ -823,7 +1002,7 @@ async function createLineCleanupLayer(image: Buffer, region: PixelRegion, imageW
     }
   }
   const safeAreaRatio = region.safe.width * region.safe.height / Math.max(1, region.width * region.height)
-  if (region.kind === 'narration' && safeAreaRatio >= 0.6) {
+  if (!aggressive && region.kind === 'narration' && safeAreaRatio >= 0.6) {
     const plan = narrationCaptionPlanFromMatch(rawMatch, region, imageWidth, imageHeight)
     if (plan && await narrationPlanHasColoredInk(image, plan)) {
       const preferredCaption = await createNarrationCaptionPlate(rawMatch, region, imageWidth, imageHeight)
@@ -835,8 +1014,11 @@ async function createLineCleanupLayer(image: Buffer, region: PixelRegion, imageW
   // and neighboring bubbles to be painted over in the old renderer.
   const edgeLines = edgeAwareCleanupLines(match, region, imageWidth, imageHeight)
   const verifiedOcrLines = match.coverage >= minimumOcrCoverage && match.lines.length > 0
+  // Aggressive retry expands only a source-linked OCR mask. It must never turn
+  // the CV fallback or a weak partial match into a larger artwork-covering box.
+  if (aggressive && !aggressiveCleanupIsSafe(match, region)) return null
   const narrationFallback = (): Promise<PreparedLayerBase | null> => {
-    return createNarrationCaptionPlate(rawMatch, region, imageWidth, imageHeight)
+    return aggressive ? Promise.resolve(null) : createNarrationCaptionPlate(rawMatch, region, imageWidth, imageHeight)
   }
   const ocrLines = verifiedOcrLines || edgeLines.length > 0
   const lines = verifiedOcrLines
@@ -849,11 +1031,11 @@ async function createLineCleanupLayer(image: Buffer, region: PixelRegion, imageW
   if (lines.length === 0) {
     return narrationFallback()
   }
-  const padding = Math.max(2, Math.round(median(lines.map((line) => line.height)) * 0.28))
-  const boundaryLeft = ocrLines ? 0 : region.x
-  const boundaryTop = ocrLines ? 0 : region.y
-  const boundaryRight = ocrLines ? imageWidth : region.x + region.width
-  const boundaryBottom = ocrLines ? imageHeight : region.y + region.height
+  const padding = Math.max(2, Math.round(median(lines.map((line) => line.height)) * (aggressive ? 0.42 : 0.28)))
+  const boundaryLeft = aggressive ? region.x : ocrLines ? 0 : region.x
+  const boundaryTop = aggressive ? region.y : ocrLines ? 0 : region.y
+  const boundaryRight = aggressive ? region.x + region.width : ocrLines ? imageWidth : region.x + region.width
+  const boundaryBottom = aggressive ? region.y + region.height : ocrLines ? imageHeight : region.y + region.height
   const boxes = lines.map((line) => ({
     left: Math.max(boundaryLeft, line.x - padding),
     top: Math.max(boundaryTop, line.y - padding),
@@ -907,8 +1089,8 @@ async function createLineCleanupLayer(image: Buffer, region: PixelRegion, imageW
     }
   }
   const lineHeight = Math.max(5, median(lines.map((line) => line.height)))
-  const componentMaximumWidth = Math.max(18, Math.round(lineHeight * 2.5))
-  const componentMaximumHeight = Math.max(8, Math.round(lineHeight * 1.25))
+  const componentMaximumWidth = Math.max(18, Math.round(lineHeight * (aggressive ? 3 : 2.5)))
+  const componentMaximumHeight = Math.max(8, Math.round(lineHeight * (aggressive ? 1.4 : 1.25)))
   const components = findInkComponents(grayscale, width, height, inkThreshold)
   const acceptedComponents = components.filter((component) => {
     if (component.width > componentMaximumWidth || component.height > componentMaximumHeight) return false
@@ -939,7 +1121,7 @@ async function createLineCleanupLayer(image: Buffer, region: PixelRegion, imageW
   if (darkPixels < 2 || lightSamples.length < 4) {
     return narrationFallback()
   }
-  const dilationRadius = Math.max(1, Math.min(5, Math.round(lineHeight * 0.13)))
+  const dilationRadius = Math.max(1, Math.min(aggressive ? 7 : 5, Math.round(lineHeight * (aggressive ? 0.2 : 0.13))))
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
       if (!dark[y * width + x]) continue
@@ -1006,7 +1188,8 @@ async function createLineCleanupLayer(image: Buffer, region: PixelRegion, imageW
       }
     }
     const filledPixels = alpha.reduce((total, value) => total + (value > 0 ? 1 : 0), 0)
-    if (filledPixels > region.width * region.height * 0.55) {
+    if (filledPixels > region.width * region.height * (aggressive ? 0.4 : 0.55)
+      || aggressive && filledPixels > region.safe.width * region.safe.height * 1.15) {
       return narrationFallback()
     }
     background.r = 255
@@ -1033,7 +1216,21 @@ export interface RenderTranslationResult {
   renderedRegions: number
 }
 
-export async function renderTranslationDetailed(image: Buffer, result: TranslationResult, ocrWordsOverride?: OcrWord[]): Promise<RenderTranslationResult> {
+export interface RenderTranslationOptions {
+  ocrWordsOverride?: OcrWord[]
+  aggressiveRegionIds?: Iterable<number>
+}
+
+export async function renderTranslationDetailed(
+  image: Buffer,
+  result: TranslationResult,
+  ocrWordsOverrideOrOptions?: OcrWord[] | RenderTranslationOptions,
+  legacyOptions: RenderTranslationOptions = {},
+): Promise<RenderTranslationResult> {
+  const options = Array.isArray(ocrWordsOverrideOrOptions)
+    ? { ...legacyOptions, ocrWordsOverride: ocrWordsOverrideOrOptions }
+    : (ocrWordsOverrideOrOptions ?? legacyOptions)
+  const aggressiveRegionIds = new Set(options.aggressiveRegionIds ?? [])
   const normalizedImage = await sharp(image).rotate().png().toBuffer()
   const base = sharp(normalizedImage)
   const metadata = await base.metadata()
@@ -1047,9 +1244,9 @@ export async function renderTranslationDetailed(image: Buffer, result: Translati
   if (regions.length === 0) {
     return { image: await base.webp({ quality: 92 }).toBuffer(), expectedRegions, renderedRegions: 0 }
   }
-  const ocrWords = ocrWordsOverride ?? await detectTesseractWords(normalizedImage)
+  const ocrWords = options.ocrWordsOverride ?? await detectOcrWords(normalizedImage)
   const renderedRegions = await Promise.all(regions.map(async (region) => {
-    let prepared = await createLineCleanupLayer(normalizedImage, region, width, height, ocrWords)
+    let prepared = await createLineCleanupLayer(normalizedImage, region, width, height, ocrWords, aggressiveRegionIds.has(region.id))
     if (!prepared) return null
     let textLayer = await createTextLayer(prepared.layout, width)
     if (!textLayer && prepared.fallback) {

@@ -2,7 +2,24 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { assertTranslationModel } from './config.js'
-import type { ChapterRow, JobRow, PageRow, SeriesRow, SourceChapter, SourcePage, SourceSeries } from './types.js'
+import type {
+  ChapterRow,
+  JobRow,
+  PageRow,
+  SeriesMemoryEntry,
+  SeriesRow,
+  SourceChapter,
+  SourcePage,
+  SourceSeries,
+  TranslationMemoryCategory,
+  TranslationMemoryDelta,
+} from './types.js'
+
+const memoryCategories = new Set<TranslationMemoryCategory>(['character', 'place', 'term', 'address', 'voice'])
+
+export function canonicalSourceKey(value: string): string {
+  return value.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '')
+}
 
 export function hasTranslationOutput(page: Pick<PageRow, 'translated_path' | 'translation_json' | 'status'>): boolean {
   return page.status === 'completed' && Boolean(page.translated_path && page.translation_json.trim())
@@ -31,6 +48,18 @@ export class Store {
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
+      CREATE TABLE IF NOT EXISTS series_memory (
+        series_hid TEXT NOT NULL REFERENCES series(hid) ON DELETE CASCADE,
+        category TEXT NOT NULL CHECK(category IN ('character','place','term','address','voice')),
+        source_key TEXT NOT NULL,
+        source TEXT NOT NULL,
+        translation TEXT NOT NULL DEFAULT '',
+        note TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY(series_hid, category, source_key)
+      );
+      CREATE INDEX IF NOT EXISTS series_memory_series_created
+        ON series_memory(series_hid, created_at DESC);
       CREATE TABLE IF NOT EXISTS chapters (
         id INTEGER PRIMARY KEY,
         series_hid TEXT NOT NULL REFERENCES series(hid) ON DELETE CASCADE,
@@ -227,6 +256,99 @@ export class Store {
     this.db.prepare(`UPDATE pages SET ${fields} WHERE chapter_id=? AND position=?`).run(...entries.map(([, value]) => value), chapterId, position)
   }
 
+  /**
+   * Makes a page visible as completed and records its series-level terminology
+   * in the same write transaction. Existing keys are immutable by design.
+   */
+  completePageTranslation(
+    chapterId: number,
+    position: number,
+    translatedPath: string,
+    translationJson: string,
+    memoryDelta: readonly TranslationMemoryDelta[] = [],
+  ): number {
+    const chapter = this.db.prepare('SELECT series_hid FROM chapters WHERE id=?').get(chapterId) as { series_hid: string } | undefined
+    if (!chapter) throw new Error(`章節 ${chapterId} 不存在`)
+    const update = this.db.prepare(`
+      UPDATE pages SET translated_path=?, translation_json=?, status='completed', error=''
+      WHERE chapter_id=? AND position=?
+    `)
+    const insert = this.db.prepare(`
+      INSERT OR IGNORE INTO series_memory (series_hid, category, source_key, source, translation, note)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `)
+    let inserted = 0
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const result = update.run(translatedPath, translationJson, chapterId, position)
+      if (Number(result.changes) !== 1) throw new Error(`頁面 ${chapterId}/${position} 不存在`)
+      for (const raw of memoryDelta) {
+        const category = raw.category
+        if (!memoryCategories.has(category)) continue
+        const source = typeof raw.source === 'string' ? raw.source.trim().slice(0, 160) : ''
+        const translation = typeof raw.translation === 'string' ? raw.translation.trim().slice(0, 160) : ''
+        const note = typeof raw.note === 'string' ? raw.note.trim().slice(0, 240) : ''
+        const sourceKey = canonicalSourceKey(source)
+        if (!sourceKey) continue
+        if (category === 'voice' ? !note : !translation) continue
+        inserted += Number(insert.run(chapter.series_hid, category, sourceKey, source, translation, note).changes)
+      }
+      this.db.exec('COMMIT')
+      return inserted
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  seriesMemory(seriesHid: string, relevanceText = '', limit = 24): SeriesMemoryEntry[] {
+    const boundedLimit = Number.isSafeInteger(limit) ? Math.max(1, Math.min(limit, 48)) : 24
+    const relevanceKey = canonicalSourceKey(relevanceText)
+    const relevant = relevanceKey ? this.db.prepare(`
+      SELECT series_hid, category, source_key, source, translation, note, created_at, rowid AS memory_rowid
+      FROM series_memory
+      WHERE series_hid=? AND INSTR(?, source_key)>0
+      ORDER BY created_at DESC, rowid DESC LIMIT 48
+    `).all(seriesHid, relevanceKey) as unknown as Array<SeriesMemoryEntry & { memory_rowid: number }> : []
+    const recent = this.db.prepare(`
+      SELECT series_hid, category, source_key, source, translation, note, created_at, rowid AS memory_rowid
+      FROM series_memory WHERE series_hid=?
+      ORDER BY created_at DESC, rowid DESC LIMIT 48
+    `).all(seriesHid) as unknown as Array<SeriesMemoryEntry & { memory_rowid: number }>
+    const candidates = [...relevant, ...recent.filter((entry) => !relevant.some((match) => (
+      match.category === entry.category && match.source_key === entry.source_key
+    )))]
+    const scored = candidates.map((entry, index) => {
+      const translationKey = canonicalSourceKey(entry.translation)
+      const sourceMatch = entry.source_key.length >= 2 && relevanceKey.includes(entry.source_key)
+      const translationMatch = translationKey.length >= 2 && relevanceKey.includes(translationKey)
+      return { entry, index, score: sourceMatch ? 2 : translationMatch ? 1 : 0 }
+    })
+    const selected = scored
+      .filter(({ score }) => score > 0)
+      .sort((left, right) => right.score - left.score || left.index - right.index)
+      .map(({ entry }) => entry)
+    const seen = new Set(selected.map((entry) => `${entry.category}\0${entry.source_key}`))
+    // A small recent baseline keeps recurring names available when the next
+    // image cannot be searched before model vision runs; matched entries win.
+    for (const entry of candidates) {
+      if (selected.length >= Math.min(8, boundedLimit)) break
+      const key = `${entry.category}\0${entry.source_key}`
+      if (seen.has(key)) continue
+      selected.push(entry)
+      seen.add(key)
+    }
+    return selected.slice(0, boundedLimit).map(({ series_hid, category, source_key, source, translation, note, created_at }) => ({
+      series_hid,
+      category,
+      source_key,
+      source,
+      translation,
+      note,
+      created_at,
+    }))
+  }
+
   setChapterStatus(id: number, status: ChapterRow['status']): void {
     this.db.prepare('UPDATE chapters SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?').run(status, id)
   }
@@ -279,7 +401,8 @@ export class Store {
     return this.db.prepare(`
       SELECT j.*, c.series_hid, s.title AS series_title, c.number AS chapter_number
       FROM jobs j JOIN chapters c ON c.id=j.chapter_id JOIN series s ON s.hid=c.series_hid
-      WHERE j.status='queued' ORDER BY j.created_at
+      WHERE j.status='queued'
+      ORDER BY j.created_at, c.series_hid, c.number, c.id, j.rowid
     `).all() as unknown as JobRow[]
   }
 
