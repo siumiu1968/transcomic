@@ -10,7 +10,7 @@ import { hasTranslationOutput, Store } from './db.js'
 import type { OcrDetection } from './ocr.js'
 import { completionStatus, presentJobError, TranslationQueue } from './queue.js'
 import { balanceTranslationLines, detectVisualTextLines, filterUsableOcrLines, matchEdgeClippedOcrLines, matchOcrLines, modelBackedVisualLinesAreTight, normalizeDisplayText, planNarrationCaption, renderTranslation, renderTranslationDetailed } from './renderer.js'
-import { codexTimeoutForEffort, mergeTranslationResults, parseTranslationOutput, withAuditFallback } from './translator.js'
+import { codexAttemptPlan, codexTimeoutForEffort, mergeTranslationResults, parseTranslationOutput, withAuditFallback } from './translator.js'
 
 const successfulEmptyOcr = async (): Promise<OcrDetection> => ({
   words: [],
@@ -524,6 +524,16 @@ test('audit failure preserves the completed primary result', async () => {
 test('Max reasoning has enough time for dense manga pages', () => {
   assert.ok(codexTimeoutForEffort('max') >= 15 * 60_000)
   assert.ok(codexTimeoutForEffort('xhigh') >= 10 * 60_000)
+})
+
+test('Max translation falls back to High after a bounded first attempt', () => {
+  assert.deepEqual(codexAttemptPlan('max'), [
+    { effort: 'max', timeoutMs: 3 * 60_000 },
+    { effort: 'high', timeoutMs: codexTimeoutForEffort('high') },
+  ])
+  assert.deepEqual(codexAttemptPlan('high'), [
+    { effort: 'high', timeoutMs: codexTimeoutForEffort('high') },
+  ])
 })
 
 test('a partially rendered chapter is not reported as a completed job', () => {

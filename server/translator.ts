@@ -34,6 +34,30 @@ export function codexTimeoutForEffort(effort: ReasoningEffort): number {
   return config.codexTimeoutMs
 }
 
+export interface CodexAttempt {
+  effort: ReasoningEffort
+  timeoutMs: number
+}
+
+const maxPrimaryAttemptMs = 3 * 60_000
+
+export function codexAttemptPlan(effort: ReasoningEffort): CodexAttempt[] {
+  if (effort === 'max') {
+    return [
+      { effort: 'max', timeoutMs: maxPrimaryAttemptMs },
+      { effort: 'high', timeoutMs: codexTimeoutForEffort('high') },
+    ]
+  }
+  return [{ effort, timeoutMs: codexTimeoutForEffort(effort) }]
+}
+
+class CodexTranslationTimeoutError extends Error {
+  constructor() {
+    super('Codex 翻譯逾時')
+    this.name = 'CodexTranslationTimeoutError'
+  }
+}
+
 const boxSchema = {
   type: 'object',
   additionalProperties: false,
@@ -673,41 +697,59 @@ export class MangaTranslator {
         ...images.map((image, index) => fs.writeFile(inputPaths[index], image, { mode: 0o600 })),
         fs.writeFile(schemaPath, JSON.stringify(responseSchema), { mode: 0o600 }),
       ])
-      const args = [
-        'exec', '--ignore-user-config', '--ignore-rules', '--ephemeral', '--sandbox', 'read-only',
-        '--skip-git-repo-check', '--color', 'never', '-m', model,
-        '-c', `model_reasoning_effort="${effort}"`, '-C', folder,
-        ...inputPaths.flatMap((inputPath) => ['--image', inputPath]),
-        '--output-schema', schemaPath, '-o', outputPath, '-',
-      ]
-      await new Promise<void>((resolve, reject) => {
-        const child = spawn(config.codexCliPath, args, {
-          cwd: folder,
-          env: { ...process.env, NO_COLOR: '1' },
-          stdio: ['pipe', 'ignore', 'pipe'],
-        })
-        let stderr = ''
-        let timedOut = false
-        const timeout = setTimeout(() => {
-          timedOut = true
-          child.kill('SIGTERM')
-        }, codexTimeoutForEffort(effort))
-        child.stderr.on('data', (chunk: Buffer) => {
-          if (stderr.length < 64_000) stderr += chunk.toString('utf8')
-        })
-        child.once('error', (error) => {
-          clearTimeout(timeout)
-          reject(error)
-        })
-        child.once('close', (code) => {
-          clearTimeout(timeout)
-          if (timedOut) reject(new Error('Codex 翻譯逾時'))
-          else if (code !== 0) reject(new Error(stderr.trim().split('\n').slice(-8).join('\n') || `Codex 結束代碼 ${code}`))
-          else resolve()
-        })
-        child.stdin.end(prompt)
-      })
-      return parseTranslationOutput(await fs.readFile(outputPath, 'utf8'))
+      const attempts = codexAttemptPlan(effort)
+      for (const [attemptIndex, attempt] of attempts.entries()) {
+        await fs.rm(outputPath, { force: true })
+        const args = [
+          'exec', '--ignore-user-config', '--ignore-rules', '--ephemeral', '--sandbox', 'read-only',
+          '--skip-git-repo-check', '--color', 'never', '-m', model,
+          '-c', `model_reasoning_effort="${attempt.effort}"`, '-C', folder,
+          ...inputPaths.flatMap((inputPath) => ['--image', inputPath]),
+          '--output-schema', schemaPath, '-o', outputPath, '-',
+        ]
+        try {
+          await new Promise<void>((resolve, reject) => {
+            const child = spawn(config.codexCliPath, args, {
+              cwd: folder,
+              env: { ...process.env, NO_COLOR: '1' },
+              stdio: ['pipe', 'ignore', 'pipe'],
+            })
+            let stderr = ''
+            let timedOut = false
+            let settled = false
+            let forceKill: NodeJS.Timeout | undefined
+            const finish = (error?: Error) => {
+              if (settled) return
+              settled = true
+              clearTimeout(timeout)
+              if (forceKill) clearTimeout(forceKill)
+              if (error) reject(error)
+              else resolve()
+            }
+            const timeout = setTimeout(() => {
+              timedOut = true
+              child.kill('SIGTERM')
+              forceKill = setTimeout(() => child.kill('SIGKILL'), 1_000)
+            }, attempt.timeoutMs)
+            child.stderr.on('data', (chunk: Buffer) => {
+              if (stderr.length < 64_000) stderr += chunk.toString('utf8')
+            })
+            child.once('error', (error) => finish(error))
+            child.once('close', (code) => {
+              if (timedOut) finish(new CodexTranslationTimeoutError())
+              else if (code !== 0) finish(new Error(stderr.trim().split('\n').slice(-8).join('\n') || `Codex 結束代碼 ${code}`))
+              else finish()
+            })
+            child.stdin.end(prompt)
+          })
+          return parseTranslationOutput(await fs.readFile(outputPath, 'utf8'))
+        } catch (error) {
+          const hasFallback = attemptIndex < attempts.length - 1
+          if (error instanceof CodexTranslationTimeoutError && hasFallback) continue
+          throw error
+        }
+      }
+      throw new Error('Codex 翻譯未有可用嘗試')
     } finally {
       await fs.rm(folder, { recursive: true, force: true })
     }
