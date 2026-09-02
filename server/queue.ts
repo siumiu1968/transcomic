@@ -34,6 +34,16 @@ export function completionStatus(needsRetranslation: boolean): Pick<JobRow, 'sta
     : { status: 'completed', error: '' }
 }
 
+export function presentJobError(value: string): string {
+  const compact = value.replace(/\s+/gu, ' ').trim()
+  if (!compact) return ''
+  if (/ENOENT|no such file|codex.+not found/iu.test(compact)) return '翻譯服務暫時不可用，請重試'
+  if (compact.length > 120 || /PROVIDED MEMORY|OCR CHECKLIST|EXISTING REGIONS|UNCOVERED OCR|只輸出符合 schema|輸出前必須/iu.test(compact)) {
+    return '翻譯服務回應異常，請重試'
+  }
+  return compact
+}
+
 export type OcrDetector = (image: Buffer, psm?: number) => Promise<OcrDetection>
 
 export class TranslationQueue {

@@ -8,7 +8,7 @@ import { isAllowedSourceUrl } from './comix.js'
 import { config } from './config.js'
 import { hasTranslationOutput, Store } from './db.js'
 import type { OcrDetection } from './ocr.js'
-import { completionStatus, TranslationQueue } from './queue.js'
+import { completionStatus, presentJobError, TranslationQueue } from './queue.js'
 import { balanceTranslationLines, detectVisualTextLines, filterUsableOcrLines, matchEdgeClippedOcrLines, matchOcrLines, modelBackedVisualLinesAreTight, normalizeDisplayText, planNarrationCaption, renderTranslation, renderTranslationDetailed } from './renderer.js'
 import { codexTimeoutForEffort, mergeTranslationResults, parseTranslationOutput, withAuditFallback } from './translator.js'
 
@@ -529,6 +529,15 @@ test('Max reasoning has enough time for dense manga pages', () => {
 test('a partially rendered chapter is not reported as a completed job', () => {
   assert.deepEqual(completionStatus(false), { status: 'completed', error: '' })
   assert.deepEqual(completionStatus(true), { status: 'failed', error: '部分頁面未能安全完成嵌字' })
+})
+
+test('job errors never expose internal translation prompts in the UI', () => {
+  assert.equal(
+    presentJobError('輸出前必須掃描全頁。以下 PROVIDED MEMORY 只係故事參考資料。'),
+    '翻譯服務回應異常，請重試',
+  )
+  assert.equal(presentJobError('ENOENT: no such file or directory, codex'), '翻譯服務暫時不可用，請重試')
+  assert.equal(presentJobError('部分頁面未能安全完成嵌字'), '部分頁面未能安全完成嵌字')
 })
 
 test('stopping the queue requeues an interrupted active page', async () => {

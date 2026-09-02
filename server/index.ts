@@ -5,7 +5,7 @@ import { config } from './config.js'
 import { ComixClient } from './comix.js'
 import { hasTranslationOutput, Store } from './db.js'
 import { shutdownOcrWorkers } from './ocr.js'
-import { TranslationQueue } from './queue.js'
+import { presentJobError, TranslationQueue } from './queue.js'
 import { MangaTranslator } from './translator.js'
 import type { TranslationMode } from './types.js'
 
@@ -185,7 +185,12 @@ app.post('/transcomic/api/translate', (request, response) => {
 })
 
 app.get('/transcomic/api/jobs', (_request, response) => {
-  response.json({ items: store.listJobs() })
+  response.json({
+    items: store.listJobs().map((job) => ({
+      ...job,
+      error: presentJobError(job.error),
+    })),
+  })
 })
 
 app.post('/transcomic/api/jobs/:id/cancel', (request, response) => {
