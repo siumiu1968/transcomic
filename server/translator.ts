@@ -166,6 +166,13 @@ function normalizeBox(value: unknown): TranslationBox | null {
   }
 }
 
+const breathSfxWords = new Set(['huff', 'puff', 'pant', 'wheeze'])
+
+export function isBreathSfxSource(source: string): boolean {
+  const words = source.match(/[A-Za-z]+/gu)?.map((word) => word.toLocaleLowerCase()) ?? []
+  return words.length > 0 && words.length <= 4 && words.every((word) => breathSfxWords.has(word))
+}
+
 function normalize(value: unknown): TranslationResult {
   const raw = value && typeof value === 'object' && Array.isArray((value as { regions?: unknown }).regions)
     ? (value as { regions: unknown[] }).regions
@@ -192,6 +199,7 @@ function normalize(value: unknown): TranslationResult {
       if (line.x < safe.x || line.y < safe.y || line.x + line.width > safe.x + safe.width || line.y + line.height > safe.y + safe.height) return []
       return [line]
     }) : []
+    const kind = region.kind === 'narration' || region.kind === 'sfx' ? region.kind : 'speech'
     return [{
       id: Number.isSafeInteger(Number(region.id)) && Number(region.id) > 0 ? Number(region.id) : index + 1,
       bubble,
@@ -199,7 +207,7 @@ function normalize(value: unknown): TranslationResult {
       lines,
       source,
       translation,
-      kind: region.kind === 'narration' || region.kind === 'sfx' ? region.kind : 'speech',
+      kind: kind === 'speech' && isBreathSfxSource(source) ? 'sfx' : kind,
     }]
   })
   const unique: TranslationRegion[] = []

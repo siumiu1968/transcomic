@@ -9,8 +9,8 @@ import { config } from './config.js'
 import { hasTranslationOutput, Store } from './db.js'
 import type { OcrDetection } from './ocr.js'
 import { completionStatus, presentJobError, TranslationQueue } from './queue.js'
-import { balanceTranslationLines, detectVisualTextLines, filterUsableOcrLines, matchEdgeClippedOcrLines, matchOcrLines, modelBackedVisualLinesAreTight, normalizeDisplayText, planNarrationCaption, renderTranslation, renderTranslationDetailed } from './renderer.js'
-import { codexAttemptPlan, codexTimeoutForEffort, mergeTranslationResults, parseTranslationOutput, withAuditFallback } from './translator.js'
+import { balanceTranslationLines, detectVisualTextLines, filterUsableOcrLines, matchEdgeClippedOcrLines, matchOcrLines, matchOcrLinesWithCoverage, modelBackedVisualLinesAreTight, normalizeDisplayText, planNarrationCaption, renderTranslation, renderTranslationDetailed } from './renderer.js'
+import { codexAttemptPlan, codexTimeoutForEffort, isBreathSfxSource, mergeTranslationResults, parseTranslationOutput, withAuditFallback } from './translator.js'
 
 const successfulEmptyOcr = async (): Promise<OcrDetection> => ({
   words: [],
@@ -88,6 +88,27 @@ test('renderer skips an unverified fallback instead of covering artwork', async 
   assert.deepEqual(rendered.skippedRegionIds, [1])
   const unverifiedInk = await sharp(rendered.image).extract({ left: 270, top: 368, width: 1, height: 1 }).raw().toBuffer()
   assert.ok(unverifiedInk[0] < 50)
+})
+
+test('verified OCR may use a bounded light speech-bubble plate when glyph cleanup is unsafe', async () => {
+  const source = Buffer.from('<svg width="600" height="900" xmlns="http://www.w3.org/2000/svg"><rect width="600" height="900" fill="#777"/><rect x="190" y="300" width="220" height="150" rx="70" fill="#fff"/><rect x="250" y="362" width="100" height="6" fill="#111"/></svg>')
+  const rendered = await renderTranslationDetailed(source, {
+    regions: [{
+      id: 9,
+      bubble: { x: 300, y: 310, width: 400, height: 220 },
+      safe: { x: 400, y: 380, width: 200, height: 80 },
+      lines: [{ x: 417, y: 394, width: 166, height: 22 }],
+      source: 'HELLO THERE',
+      translation: '你好',
+      kind: 'speech',
+    }],
+  }, [{ x: 250, y: 355, width: 100, height: 20, confidence: 99, line: 'rapidocr:1', text: 'HELLO THERE' }])
+  assert.equal(rendered.renderedRegions, 1)
+  assert.deepEqual(rendered.skippedRegionIds, [])
+  const cleaned = await sharp(rendered.image).extract({ left: 255, top: 364, width: 1, height: 1 }).removeAlpha().raw().toBuffer()
+  const artwork = await sharp(rendered.image).extract({ left: 180, top: 360, width: 1, height: 1 }).removeAlpha().raw().toBuffer()
+  assert.ok(cleaned[0] > 220)
+  assert.ok(artwork[0] < 160)
 })
 
 test('tight frameless narration uses its verified OCR plate over the original ink', async () => {
@@ -193,6 +214,14 @@ test('OCR line matching joins split words and ignores duplicate noise', () => {
     source: 'PREPARED',
   })
   assert.deepEqual(lines, [{ x: 120, y: 140, width: 106, height: 20 }])
+})
+
+test('OCR phrase matching prefers a longer near-match over one exact letter', () => {
+  const match = matchOcrLinesWithCoverage([
+    { x: 20, y: 20, width: 80, height: 24, confidence: 91, line: 'rapidocr:1', text: 'ITIL1L' },
+  ], { x: 0, y: 0, width: 140, height: 80, source: 'I STILL' })
+  assert.ok(match.coverage >= 0.9)
+  assert.ok(match.incompleteSourceWords !== undefined && match.incompleteSourceWords <= 1)
 })
 
 test('OCR line matching keeps a high-confidence stutter initial beside matched dialogue', () => {
@@ -481,6 +510,19 @@ test('translation output parser assigns unique region ids before residual retrie
     },
   ] }))
   assert.deepEqual(parsed.regions.map(({ id }) => id), [1, 2])
+})
+
+test('isolated breathing lettering is treated as SFX without hiding real dialogue', () => {
+  assert.equal(isBreathSfxSource('HUFF, HUFF...'), true)
+  assert.equal(isBreathSfxSource('HUFF, HUFF... WHY?!'), false)
+  const parsed = parseTranslationOutput(JSON.stringify({ regions: [{
+    id: 1,
+    bubble: { x: 100, y: 100, width: 200, height: 200 },
+    safe: { x: 120, y: 120, width: 160, height: 120 },
+    lines: [{ x: 130, y: 130, width: 120, height: 40 }],
+    source: 'HUFF...', translation: '呼……', kind: 'speech',
+  }] }))
+  assert.equal(parsed.regions[0]?.kind, 'sfx')
 })
 
 test('audit merge adds only a distinct missed bubble in reading order', () => {

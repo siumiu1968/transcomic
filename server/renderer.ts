@@ -580,7 +580,7 @@ export function filterUsableOcrLines<T extends PixelBox>(lines: T[], region: Pic
   })
 }
 
-function matchOcrLinesWithCoverage(words: OcrWord[], region: Pick<PixelRegion, 'x' | 'y' | 'width' | 'height' | 'source'>, strictSafe = false): OcrMatch {
+export function matchOcrLinesWithCoverage(words: OcrWord[], region: Pick<PixelRegion, 'x' | 'y' | 'width' | 'height' | 'source'>, strictSafe = false): OcrMatch {
   const sourceWords = region.source.split(/\s+/u).map(normalizedWord).filter(isSourceWord)
   if (sourceWords.length === 0) return { lines: [], coverage: 0, complete: false }
   // The model's safe box is the strongest available spatial prior. Full-page
@@ -591,12 +591,14 @@ function matchOcrLinesWithCoverage(words: OcrWord[], region: Pick<PixelRegion, '
     const normalized = normalizedWord(word.text)
     const centreX = word.x + word.width / 2
     const centreY = word.y + word.height / 2
-    const marginX = bounds.width * (strictSafe ? 0.32 : 0.35)
-    const marginY = bounds.height * (strictSafe ? 0.32 : 0.35)
+    const marginX = bounds.width * (strictSafe ? 0.32 : 0.55)
+    const marginY = bounds.height * (strictSafe ? 0.32 : 0.55)
     const reliableSingleLetter = normalized.length === 1 && word.confidence >= 70
     return (isSourceWord(normalized) || reliableSingleLetter)
       && centreX >= bounds.x - marginX && centreX <= bounds.x + bounds.width + marginX
       && centreY >= bounds.y - marginY && centreY <= bounds.y + bounds.height + marginY
+      && centreX >= region.x && centreX <= region.x + region.width
+      && centreY >= region.y && centreY <= region.y + region.height
   }
   const spatialWords = words.filter(isSpatiallyUsable)
   const coveredCharacters = sourceWords.map(() => new Set<number>())
@@ -604,39 +606,55 @@ function matchOcrLinesWithCoverage(words: OcrWord[], region: Pick<PixelRegion, '
   for (const word of spatialWords) {
     const normalized = normalizedWord(word.text)
     if (!isSourceWord(normalized)) continue
-    let bestIndex = -1
+    let bestAssignments: Array<{ index: number; positions: number[] }> = []
     let bestRatio = Number.POSITIVE_INFINITY
-    let bestPositions: number[] = []
     let bestNewCharacters = -1
-    for (let index = 0; index < sourceWords.length; index += 1) {
-      const source = sourceWords[index]
-      const variant = ocrWordVariants(normalized)
-        .map((candidate) => ({ candidate, distance: editDistance(source, candidate) }))
-        .sort((left, right) => left.distance - right.distance)[0]?.candidate ?? normalized
-      const sourceOffset = source.indexOf(variant)
-      const positions = sourceOffset >= 0
-        ? Array.from({ length: variant.length }, (_, offset) => sourceOffset + offset).filter((position) => position < source.length)
-        : variant.includes(source)
-          ? Array.from({ length: source.length }, (_, position) => position)
-          : []
-      const ratio = positions.length > 0 ? 0 : editDistance(source, variant) / Math.max(source.length, variant.length)
-      if (ratio > 0.38) continue
-      const fallbackPositions = positions.length > 0
-        ? positions
-        : Array.from({ length: source.length }, (_, position) => position)
-      const newCharacters = fallbackPositions.reduce((total, position) => total + (coveredCharacters[index].has(position) ? 0 : 1), 0)
-      if (ratio < bestRatio || (ratio === bestRatio && newCharacters > bestNewCharacters)) {
-        bestRatio = ratio
-        bestIndex = index
-        bestPositions = fallbackPositions
-        bestNewCharacters = newCharacters
+    let bestScore = -1
+    for (let start = 0; start < sourceWords.length; start += 1) {
+      for (let span = 1; span <= Math.min(4, sourceWords.length - start); span += 1) {
+        const words = sourceWords.slice(start, start + span)
+        const source = words.join('')
+        const variant = ocrWordVariants(normalized)
+          .map((candidate) => ({ candidate, distance: editDistance(source, candidate) }))
+          .sort((left, right) => left.distance - right.distance)[0]?.candidate ?? normalized
+        const sourceOffset = source.indexOf(variant)
+        const positions = sourceOffset >= 0
+          ? Array.from({ length: variant.length }, (_, offset) => sourceOffset + offset).filter((position) => position < source.length)
+          : variant.includes(source)
+            ? Array.from({ length: source.length }, (_, position) => position)
+            : []
+        const ratio = positions.length > 0 ? 0 : editDistance(source, variant) / Math.max(source.length, variant.length)
+        if (ratio > 0.38) continue
+        const combinedPositions = positions.length > 0
+          ? positions
+          : Array.from({ length: source.length }, (_, position) => position)
+        let offset = 0
+        const assignments = words.map((sourceWord, wordOffset) => {
+          const wordPositions = combinedPositions
+            .filter((position) => position >= offset && position < offset + sourceWord.length)
+            .map((position) => position - offset)
+          offset += sourceWord.length
+          return { index: start + wordOffset, positions: wordPositions }
+        }).filter(({ positions: wordPositions }) => wordPositions.length > 0)
+        const newCharacters = assignments.reduce((total, assignment) => {
+          return total + assignment.positions.reduce((subtotal, position) => subtotal + (coveredCharacters[assignment.index].has(position) ? 0 : 1), 0)
+        }, 0)
+        const score = newCharacters * (1 - ratio) ** 2
+        if (score > bestScore || (score === bestScore && ratio < bestRatio)) {
+          bestScore = score
+          bestRatio = ratio
+          bestAssignments = assignments
+          bestNewCharacters = newCharacters
+        }
       }
     }
-    if (bestIndex < 0 || bestNewCharacters <= 0) continue
+    if (bestAssignments.length === 0 || bestNewCharacters <= 0) continue
     const minimumConfidence = normalized.length <= 1 ? 70 : normalized.length <= 3 ? 40 : 10
     const reliableLowConfidenceMatch = normalized.length >= 2 && bestRatio <= 0.34
     if (word.confidence < minimumConfidence && !reliableLowConfidenceMatch) continue
-    for (const position of bestPositions) coveredCharacters[bestIndex].add(position)
+    for (const assignment of bestAssignments) {
+      for (const position of assignment.positions) coveredCharacters[assignment.index].add(position)
+    }
     matchedWords.push(word)
   }
   const totalCharacters = sourceWords.reduce((total, word) => total + word.length, 0)
@@ -694,7 +712,7 @@ function matchOcrLinesWithCoverage(words: OcrWord[], region: Pick<PixelRegion, '
   for (const line of lines) {
     const block = blocks.at(-1)
     const previous = block?.at(-1)
-    if (!block || !previous || line.y - (previous.y + previous.height) > typicalHeight * 0.85) blocks.push([line])
+    if (!block || !previous || line.y - (previous.y + previous.height) > typicalHeight * 0.72) blocks.push([line])
     else block.push(line)
   }
   const contiguousLines = blocks.sort((left, right) => {
@@ -821,6 +839,66 @@ async function createNarrationCaptionPlate(match: OcrMatch, region: PixelRegion,
   return {
     overlay: { input: await sharp(plate).png().toBuffer(), top: y, left: x },
     layout: { ...region, x, y, width, height, safe: { x, y, width, height }, captionPlate: true },
+  }
+}
+
+async function createSpeechBubblePlate(image: Buffer, match: OcrMatch, region: PixelRegion, imageWidth: number, imageHeight: number): Promise<PreparedLayerBase | null> {
+  const sourceLines = match.lines
+  const nearComplete = match.complete || match.coverage >= 0.9
+    && (match.unmatchedCharacters ?? Number.POSITIVE_INFINITY) <= 2
+    && (match.incompleteSourceWords ?? Number.POSITIVE_INFINITY) <= 1
+  if (region.kind !== 'speech' || !nearComplete || sourceLines.length === 0) return null
+  if (sourceLines.some((line) => line.confidence < 25) || median(sourceLines.map((line) => line.confidence)) < 55) return null
+  const lineHeight = Math.max(5, median(sourceLines.map((line) => line.height)))
+  const envelopeMargin = Math.max(5, Math.round(lineHeight * 0.42))
+  const insideBubble = sourceLines.every((line) => {
+    const centreX = line.x + line.width / 2
+    const centreY = line.y + line.height / 2
+    return centreX >= region.x && centreX <= region.x + region.width
+      && centreY >= region.y && centreY <= region.y + region.height
+      && line.x >= region.x - envelopeMargin && line.y >= region.y - envelopeMargin
+      && line.x + line.width <= region.x + region.width + envelopeMargin
+      && line.y + line.height <= region.y + region.height + envelopeMargin
+  })
+  if (!insideBubble) return null
+  const paddingX = Math.max(5, Math.min(14, Math.round(lineHeight * 0.42)))
+  const paddingY = Math.max(4, Math.min(11, Math.round(lineHeight * 0.3)))
+  const x = Math.max(0, region.x, Math.min(...sourceLines.map((line) => line.x)) - paddingX)
+  const y = Math.max(0, region.y, Math.min(...sourceLines.map((line) => line.y)) - paddingY)
+  const right = Math.min(imageWidth, region.x + region.width, Math.max(...sourceLines.map((line) => line.x + line.width)) + paddingX)
+  const bottom = Math.min(imageHeight, region.y + region.height, Math.max(...sourceLines.map((line) => line.y + line.height)) + paddingY)
+  const width = right - x
+  const height = bottom - y
+  const area = width * height
+  if (width < 18 || height < 14 || area > region.width * region.height * 0.45 || area > imageWidth * imageHeight * 0.04) return null
+  const sampled = await sharp(image)
+    .extract({ left: x, top: y, width, height })
+    .removeAlpha()
+    .toColourspace('srgb')
+    .raw()
+    .toBuffer({ resolveWithObject: true })
+  const light: Array<{ r: number; g: number; b: number; luminance: number }> = []
+  for (let offset = 0; offset < sampled.data.length; offset += sampled.info.channels) {
+    const r = sampled.data[offset]
+    const g = sampled.data[offset + 1]
+    const b = sampled.data[offset + 2]
+    const luminance = (r + g + b) / 3
+    if (luminance >= 205 && Math.max(r, g, b) - Math.min(r, g, b) <= 28) light.push({ r, g, b, luminance })
+  }
+  const pixelCount = width * height
+  if (light.length < pixelCount * 0.52) return null
+  const bright = light.filter((sample) => sample.luminance >= 230)
+  if (bright.length < pixelCount * 0.35) return null
+  const background = {
+    r: Math.round(bright.reduce((total, sample) => total + sample.r, 0) / bright.length),
+    g: Math.round(bright.reduce((total, sample) => total + sample.g, 0) / bright.length),
+    b: Math.round(bright.reduce((total, sample) => total + sample.b, 0) / bright.length),
+  }
+  if ((background.r + background.g + background.b) / 3 < 235) return null
+  const plate = Buffer.from(`<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg"><rect width="${width}" height="${height}" fill="rgb(${background.r},${background.g},${background.b})"/></svg>`)
+  return {
+    overlay: { input: await sharp(plate).png().toBuffer(), top: y, left: x },
+    layout: { ...region, x, y, width, height, safe: { x, y, width, height } },
   }
 }
 
@@ -1014,12 +1092,15 @@ async function createLineCleanupLayer(image: Buffer, region: PixelRegion, imageW
   // and neighboring bubbles to be painted over in the old renderer.
   const edgeLines = edgeAwareCleanupLines(match, region, imageWidth, imageHeight)
   const verifiedOcrLines = match.coverage >= minimumOcrCoverage && match.lines.length > 0
-  // Aggressive retry expands only a source-linked OCR mask. It must never turn
-  // the CV fallback or a weak partial match into a larger artwork-covering box.
-  if (aggressive && !aggressiveCleanupIsSafe(match, region)) return null
   const narrationFallback = (): Promise<PreparedLayerBase | null> => {
     return aggressive ? Promise.resolve(null) : createNarrationCaptionPlate(rawMatch, region, imageWidth, imageHeight)
   }
+  const cleanupFallback = async (): Promise<PreparedLayerBase | null> => {
+    return await createSpeechBubblePlate(image, match, region, imageWidth, imageHeight) ?? narrationFallback()
+  }
+  // Aggressive retry expands only a source-linked OCR mask. It must never turn
+  // the CV fallback or a weak partial match into a larger artwork-covering box.
+  if (aggressive && !aggressiveCleanupIsSafe(match, region)) return cleanupFallback()
   const ocrLines = verifiedOcrLines || edgeLines.length > 0
   const lines = verifiedOcrLines
     ? match.lines
@@ -1029,7 +1110,7 @@ async function createLineCleanupLayer(image: Buffer, region: PixelRegion, imageW
       ? await detectVisualTextLines(image, region)
       : []
   if (lines.length === 0) {
-    return narrationFallback()
+    return cleanupFallback()
   }
   const padding = Math.max(2, Math.round(median(lines.map((line) => line.height)) * (aggressive ? 0.42 : 0.28)))
   const boundaryLeft = aggressive ? region.x : ocrLines ? 0 : region.x
@@ -1043,7 +1124,7 @@ async function createLineCleanupLayer(image: Buffer, region: PixelRegion, imageW
     bottom: Math.min(boundaryBottom, line.y + line.height + padding),
   })).filter((box) => box.right > box.left && box.bottom > box.top)
   if (boxes.length === 0) {
-    return narrationFallback()
+    return cleanupFallback()
   }
   const left = Math.min(...boxes.map((box) => box.left))
   const top = Math.min(...boxes.map((box) => box.top))
@@ -1119,7 +1200,7 @@ async function createLineCleanupLayer(image: Buffer, region: PixelRegion, imageW
     }
   }
   if (darkPixels < 2 || lightSamples.length < 4) {
-    return narrationFallback()
+    return cleanupFallback()
   }
   const dilationRadius = Math.max(1, Math.min(aggressive ? 7 : 5, Math.round(lineHeight * (aggressive ? 0.2 : 0.13))))
   for (let y = 0; y < height; y += 1) {
@@ -1138,13 +1219,13 @@ async function createLineCleanupLayer(image: Buffer, region: PixelRegion, imageW
   }
   const maskedPixels = alpha.reduce((total, value) => total + (value > 0 ? 1 : 0), 0)
   if (maskedPixels === 0) {
-    return narrationFallback()
+    return cleanupFallback()
   }
   const sortedLuminance = lightSamples.map((sample) => sample.luminance).sort((leftValue, rightValue) => leftValue - rightValue)
   const highPercentile = sortedLuminance[Math.floor((sortedLuminance.length - 1) * 0.8)] ?? 180
   const brightSamples = lightSamples.filter((sample) => sample.luminance >= highPercentile)
   if (brightSamples.length < 2) {
-    return narrationFallback()
+    return cleanupFallback()
   }
   const background = {
     r: Math.round(brightSamples.reduce((total, sample) => total + sample.r, 0) / brightSamples.length),
@@ -1153,12 +1234,12 @@ async function createLineCleanupLayer(image: Buffer, region: PixelRegion, imageW
   }
   const backgroundLuminance = (background.r + background.g + background.b) / 3
   if (backgroundLuminance < 180) {
-    return narrationFallback()
+    return cleanupFallback()
   }
   const channelSpread = Math.max(background.r, background.g, background.b) - Math.min(background.r, background.g, background.b)
   const monochromeBubble = channelSpread <= 18
   if (!monochromeBubble && maskedPixels > region.width * region.height * 0.35) {
-    return narrationFallback()
+    return cleanupFallback()
   }
   if (monochromeBubble) {
     const nearWhite = Math.max(235, Math.round((background.r + background.g + background.b) / 3))
@@ -1190,7 +1271,7 @@ async function createLineCleanupLayer(image: Buffer, region: PixelRegion, imageW
     const filledPixels = alpha.reduce((total, value) => total + (value > 0 ? 1 : 0), 0)
     if (filledPixels > region.width * region.height * (aggressive ? 0.4 : 0.55)
       || aggressive && filledPixels > region.safe.width * region.safe.height * 1.15) {
-      return narrationFallback()
+      return cleanupFallback()
     }
     background.r = 255
     background.g = 255
