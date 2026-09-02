@@ -351,6 +351,7 @@ export class TranslationQueue {
           continue
         }
         const translationJson = JSON.stringify(translation)
+        const aggressiveRegionIds = new Set<number>()
         let rendered = await renderTranslationDetailed(original, translation, { ocrWordsOverride: originalOcr })
         if (this.stopping) {
           this.requeueAfterShutdown(job, chapter.id, activePosition)
@@ -359,6 +360,13 @@ export class TranslationQueue {
         if (this.store.getJob(job.id)?.status === 'cancelled') {
           this.store.updatePage(chapter.id, page.position, { status: 'pending', error: '' })
           return
+        }
+        if (rendered.renderedRegions !== rendered.expectedRegions && rendered.skippedRegionIds.length > 0) {
+          rendered.skippedRegionIds.forEach((id) => aggressiveRegionIds.add(id))
+          rendered = await renderTranslationDetailed(original, translation, {
+            ocrWordsOverride: originalOcr,
+            aggressiveRegionIds,
+          })
         }
         if (rendered.renderedRegions !== rendered.expectedRegions) {
           needsRetranslation = true
@@ -383,9 +391,10 @@ export class TranslationQueue {
             ? []
             : findResidualSourceText(originalOcr, renderedDetection.words, translation.regions, dimensions)
           if (!ocrUnavailable && residual.length > 0) {
+            residual.forEach(({ regionId }) => aggressiveRegionIds.add(regionId))
             rendered = await renderTranslationDetailed(original, translation, {
               ocrWordsOverride: originalOcr,
-              aggressiveRegionIds: residual.map(({ regionId }) => regionId),
+              aggressiveRegionIds,
             })
             if (rendered.renderedRegions === rendered.expectedRegions) {
               renderedDetection = await this.detectOcr(rendered.image)

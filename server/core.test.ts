@@ -85,6 +85,7 @@ test('renderer skips an unverified fallback instead of covering artwork', async 
   })
   assert.equal(rendered.expectedRegions, 1)
   assert.equal(rendered.renderedRegions, 0)
+  assert.deepEqual(rendered.skippedRegionIds, [1])
   const unverifiedInk = await sharp(rendered.image).extract({ left: 270, top: 368, width: 1, height: 1 }).raw().toBuffer()
   assert.ok(unverifiedInk[0] < 50)
 })

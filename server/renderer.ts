@@ -1214,6 +1214,7 @@ export interface RenderTranslationResult {
   image: Buffer
   expectedRegions: number
   renderedRegions: number
+  skippedRegionIds: number[]
 }
 
 export interface RenderTranslationOptions {
@@ -1236,13 +1237,15 @@ export async function renderTranslationDetailed(
   const metadata = await base.metadata()
   const width = metadata.width ?? 1
   const height = metadata.height ?? 1
-  const expectedRegions = result.regions.filter((region) => region.kind !== 'sfx' && normalizeDisplayText(region.translation)).length
-  const regions = result.regions.flatMap((region) => {
+  const expected = result.regions.filter((region) => region.kind !== 'sfx' && normalizeDisplayText(region.translation))
+  const expectedRegions = expected.length
+  const expectedRegionIds = expected.map((region) => region.id)
+  const regions = expected.flatMap((region) => {
     const converted = toPixelRegion(region, width, height)
     return converted ? [converted] : []
   })
   if (regions.length === 0) {
-    return { image: await base.webp({ quality: 92 }).toBuffer(), expectedRegions, renderedRegions: 0 }
+    return { image: await base.webp({ quality: 92 }).toBuffer(), expectedRegions, renderedRegions: 0, skippedRegionIds: expectedRegionIds }
   }
   const ocrWords = options.ocrWordsOverride ?? await detectOcrWords(normalizedImage)
   const renderedRegions = await Promise.all(regions.map(async (region) => {
@@ -1254,18 +1257,20 @@ export async function renderTranslationDetailed(
       textLayer = await createTextLayer(prepared.layout, width)
     }
     if (!textLayer) return null
-    return { cleanup: prepared.overlay, text: textLayer }
+    return { id: region.id, cleanup: prepared.overlay, text: textLayer }
   }))
   const cleanupOverlays = renderedRegions.flatMap((region) => region ? [region.cleanup] : [])
   const textOverlays = renderedRegions.flatMap((region) => region ? [region.text] : [])
+  const renderedRegionIds = new Set(renderedRegions.flatMap((region) => region ? [region.id] : []))
+  const skippedRegionIds = expectedRegionIds.filter((id) => !renderedRegionIds.has(id))
   if (cleanupOverlays.length === 0) {
-    return { image: await base.webp({ quality: 92 }).toBuffer(), expectedRegions, renderedRegions: 0 }
+    return { image: await base.webp({ quality: 92 }).toBuffer(), expectedRegions, renderedRegions: 0, skippedRegionIds }
   }
   const rendered = await base.composite([
     ...cleanupOverlays,
     ...textOverlays,
   ]).webp({ quality: 92 }).toBuffer()
-  return { image: rendered, expectedRegions, renderedRegions: cleanupOverlays.length }
+  return { image: rendered, expectedRegions, renderedRegions: cleanupOverlays.length, skippedRegionIds }
 }
 
 export async function renderTranslation(image: Buffer, result: TranslationResult): Promise<Buffer> {

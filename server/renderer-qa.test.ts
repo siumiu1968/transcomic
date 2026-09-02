@@ -86,6 +86,7 @@ test('aggressive cleanup expands only a verified text-line mask', async () => {
     aggressiveRegionIds: [1],
   })
   assert.equal(aggressive.renderedRegions, 1)
+  assert.deepEqual(aggressive.skippedRegionIds, [])
   const normalResidual = await sharp(normal.image).extract({ left: 157, top: 108, width: 1, height: 1 }).removeAlpha().raw().toBuffer()
   const aggressiveCleaned = await sharp(aggressive.image).extract({ left: 157, top: 108, width: 1, height: 1 }).removeAlpha().raw().toBuffer()
   assert.ok(normalResidual[0] < 100)
@@ -107,6 +108,7 @@ test('aggressive cleanup fails closed when source-linked OCR is incomplete', asy
     aggressiveRegionIds: [2],
   })
   assert.equal(rendered.renderedRegions, 0)
+  assert.deepEqual(rendered.skippedRegionIds, [2])
   const artwork = await sharp(rendered.image).extract({ left: 125, top: 110, width: 1, height: 1 }).removeAlpha().raw().toBuffer()
   assert.ok(artwork[0] < 80)
 })
