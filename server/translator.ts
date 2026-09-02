@@ -86,7 +86,6 @@ const responseSchema = {
     ignored_ocr: {
       type: 'array',
       maxItems: 32,
-      uniqueItems: true,
       items: { type: 'integer', minimum: 1, maximum: 32 },
     },
   },
